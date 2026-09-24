@@ -443,8 +443,6 @@ func (a *prefixAccumulator) tierOrdinal(name string) uint32 {
 	return id
 }
 
-// EVOLVE-BLOCK-END
-
 // speculativeTierOrdinal keys the speculative per-tier chain. Feeders assign
 // tier ordinals from zero, so the top of the range never collides.
 const speculativeTierOrdinal = math.MaxUint32
@@ -979,4 +977,6 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 	a.weightCache = append(a.weightCache, tierWeight{ordinal: ordinal, weight: w})
 	return w
 }
+
+// EVOLVE-BLOCK-END
 
