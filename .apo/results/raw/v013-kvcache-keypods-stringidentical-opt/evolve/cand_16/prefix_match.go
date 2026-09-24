@@ -1020,16 +1020,16 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			tierOrd = speculativeTierOrdinal
 		} else {
 			tier = e.DeviceTier
-			if a.hasLastTier && (stringIdentical(a.lastTierName, e.DeviceTier) || a.lastTierName == e.DeviceTier) {
+			if a.hasLastTier && a.lastTierName == e.DeviceTier {
 				tierOrd = a.lastTierOrd
 			} else {
-				if stringIdentical(a.tierCache[0].name, e.DeviceTier) || a.tierCache[0].name == e.DeviceTier {
+				if a.tierCache[0].name == e.DeviceTier {
 					tierOrd = a.tierCache[0].ord
-				} else if stringIdentical(a.tierCache[1].name, e.DeviceTier) || a.tierCache[1].name == e.DeviceTier {
+				} else if a.tierCache[1].name == e.DeviceTier {
 					tierOrd = a.tierCache[1].ord
-				} else if stringIdentical(a.tierCache[2].name, e.DeviceTier) || a.tierCache[2].name == e.DeviceTier {
+				} else if a.tierCache[2].name == e.DeviceTier {
 					tierOrd = a.tierCache[2].ord
-				} else if stringIdentical(a.tierCache[3].name, e.DeviceTier) || a.tierCache[3].name == e.DeviceTier {
+				} else if a.tierCache[3].name == e.DeviceTier {
 					tierOrd = a.tierCache[3].ord
 				} else {
 					tierOrd = a.tierOrdinal(e.DeviceTier)
@@ -1161,12 +1161,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	for i := range entries {
 		e := &entries[i]
 
-		var s int32
-		var podOrd uint32
-		var tierOrd uint32
-		var tier string
-		var ok bool
-
 		if i < 256 {
 			entry := &a.posCache256[i]
 			if (stringIdentical(entry.podName, e.PodIdentifier) || entry.podName == e.PodIdentifier) &&
@@ -1217,6 +1211,12 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 		}
 
+		var s int32
+		var podOrd uint32
+		var tierOrd uint32
+		var tier string
+		var ok bool
+
 		var found bool
 		if a.hasMru && (stringIdentical(a.mruName, e.PodIdentifier) || a.mruName == e.PodIdentifier) {
 			podOrd = a.mruOrd
@@ -1255,16 +1255,16 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			tierOrd = speculativeTierOrdinal
 		} else {
 			tier = e.DeviceTier
-			if a.hasLastTier && (stringIdentical(a.lastTierName, e.DeviceTier) || a.lastTierName == e.DeviceTier) {
+			if a.hasLastTier && a.lastTierName == e.DeviceTier {
 				tierOrd = a.lastTierOrd
 			} else {
-				if stringIdentical(a.tierCache[0].name, e.DeviceTier) || a.tierCache[0].name == e.DeviceTier {
+				if a.tierCache[0].name == e.DeviceTier {
 					tierOrd = a.tierCache[0].ord
-				} else if stringIdentical(a.tierCache[1].name, e.DeviceTier) || a.tierCache[1].name == e.DeviceTier {
+				} else if a.tierCache[1].name == e.DeviceTier {
 					tierOrd = a.tierCache[1].ord
-				} else if stringIdentical(a.tierCache[2].name, e.DeviceTier) || a.tierCache[2].name == e.DeviceTier {
+				} else if a.tierCache[2].name == e.DeviceTier {
 					tierOrd = a.tierCache[2].ord
-				} else if stringIdentical(a.tierCache[3].name, e.DeviceTier) || a.tierCache[3].name == e.DeviceTier {
+				} else if a.tierCache[3].name == e.DeviceTier {
 					tierOrd = a.tierCache[3].ord
 				} else {
 					tierOrd = a.tierOrdinal(e.DeviceTier)

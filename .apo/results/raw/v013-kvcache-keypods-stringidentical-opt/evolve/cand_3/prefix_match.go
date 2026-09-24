@@ -182,10 +182,10 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	weights map[string]float64, filter sets.Set[string],
 ) (map[string]PodMatch, error) {
 	acc := acquireAccumulator(weights, filter)
-	defer releaseAccumulator(acc)
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
+			releaseAccumulator(acc)
 			return nil, ctx.Err()
 		}
 		entries := keyToPods[key]
@@ -199,9 +199,12 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	// Cancellation is sampled at checkpoints along the keys and once more at
 	// completion, so a cancelled request never reports a match.
 	if err := ctx.Err(); err != nil {
+		releaseAccumulator(acc)
 		return nil, err
 	}
-	return acc.result(), nil
+	res := acc.result()
+	releaseAccumulator(acc)
+	return res, nil
 }
 
 func (a *prefixAccumulator) podOrdinal(name string) uint32 {
@@ -935,7 +938,7 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 		var byTier map[string]int
 		if len(s.tiers) == 0 {
 			if s.hasTier0 {
-				if (stringIdentical(s.tier0Name, a.lastSingularName) || s.tier0Name == a.lastSingularName) && s.tier0Count == a.lastSingularCount {
+				if s.tier0Count == a.lastSingularCount && (stringIdentical(s.tier0Name, a.lastSingularName) || s.tier0Name == a.lastSingularName) {
 					byTier = a.lastSingularMap
 				} else {
 					slice := a.singularCache[s.tier0Name]
@@ -1015,7 +1018,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		// Resolve tier ordinal and tier name
 		var tierOrd uint32
 		var tier string
-		if e.Speculative || e.DeviceTier == SpeculativeTier {
+		if e.Speculative || stringIdentical(e.DeviceTier, SpeculativeTier) || e.DeviceTier == SpeculativeTier {
 			tier = SpeculativeTier
 			tierOrd = speculativeTierOrdinal
 		} else {
@@ -1160,6 +1163,14 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 
 	for i := range entries {
 		e := &entries[i]
+		if i > 0 {
+			prev := &entries[i-1]
+			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
+				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
+				prev.Speculative == e.Speculative {
+				continue
+			}
+		}
 
 		var s int32
 		var podOrd uint32
@@ -1204,15 +1215,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						}
 					}
 				}
-				continue
-			}
-		}
-
-		if i > 0 {
-			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
-				prev.Speculative == e.Speculative {
+				if !a.hasMru || a.mruOrd != entry.podOrd {
+					a.mruName = entry.podName
+					a.mruOrd = entry.podOrd
+					a.hasMru = true
+				}
 				continue
 			}
 		}
@@ -1250,7 +1257,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			continue
 		}
 
-		if e.Speculative || e.DeviceTier == SpeculativeTier {
+		if e.Speculative || stringIdentical(e.DeviceTier, SpeculativeTier) || e.DeviceTier == SpeculativeTier {
 			tier = SpeculativeTier
 			tierOrd = speculativeTierOrdinal
 		} else {
@@ -1395,7 +1402,7 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 		if (a.speculativeTierChecked & (1 << ordinal)) != 0 {
 			isSpeculative = (a.speculativeTierMask & (1 << ordinal)) != 0
 		} else {
-			isSpeculative = tier == SpeculativeTier
+			isSpeculative = stringIdentical(tier, SpeculativeTier) || tier == SpeculativeTier
 			a.speculativeTierChecked |= (1 << ordinal)
 			if isSpeculative {
 				a.speculativeTierMask |= (1 << ordinal)
@@ -1429,7 +1436,7 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 		}
 	}
 	w := unknownTierWeight
-	if tier == SpeculativeTier {
+	if stringIdentical(tier, SpeculativeTier) || tier == SpeculativeTier {
 		w = speculativeTierWeight
 	}
 	if configured, ok := a.weights[tier]; ok {

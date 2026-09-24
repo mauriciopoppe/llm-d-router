@@ -515,14 +515,14 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 				if (a.speculativeTierChecked & (1 << ref.TierOrdinal)) != 0 {
 					isSpeculative = (a.speculativeTierMask & (1 << ref.TierOrdinal)) != 0
 				} else {
-					isSpeculative = ref.DeviceTier == SpeculativeTier
+					isSpeculative = stringIdentical(ref.DeviceTier, SpeculativeTier) || ref.DeviceTier == SpeculativeTier
 					a.speculativeTierChecked |= (1 << ref.TierOrdinal)
 					if isSpeculative {
 						a.speculativeTierMask |= (1 << ref.TierOrdinal)
 					}
 				}
 			} else {
-				isSpeculative = ref.DeviceTier == SpeculativeTier
+				isSpeculative = stringIdentical(ref.DeviceTier, SpeculativeTier) || ref.DeviceTier == SpeculativeTier
 			}
 		}
 		if isSpeculative {
@@ -712,14 +712,14 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				if (a.speculativeTierChecked & (1 << tierOrdinal)) != 0 {
 					isSpeculative = (a.speculativeTierMask & (1 << tierOrdinal)) != 0
 				} else {
-					isSpeculative = ref.DeviceTier == SpeculativeTier
+					isSpeculative = stringIdentical(ref.DeviceTier, SpeculativeTier) || ref.DeviceTier == SpeculativeTier
 					a.speculativeTierChecked |= (1 << tierOrdinal)
 					if isSpeculative {
 						a.speculativeTierMask |= (1 << tierOrdinal)
 					}
 				}
 			} else {
-				isSpeculative = ref.DeviceTier == SpeculativeTier
+				isSpeculative = stringIdentical(ref.DeviceTier, SpeculativeTier) || ref.DeviceTier == SpeculativeTier
 			}
 		}
 		if isSpeculative {
@@ -935,7 +935,7 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 		var byTier map[string]int
 		if len(s.tiers) == 0 {
 			if s.hasTier0 {
-				if (stringIdentical(s.tier0Name, a.lastSingularName) || s.tier0Name == a.lastSingularName) && s.tier0Count == a.lastSingularCount {
+				if s.tier0Count == a.lastSingularCount && (stringIdentical(s.tier0Name, a.lastSingularName) || s.tier0Name == a.lastSingularName) {
 					byTier = a.lastSingularMap
 				} else {
 					slice := a.singularCache[s.tier0Name]
@@ -980,9 +980,9 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		e := &entries[i]
 		if i > 0 {
 			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
-				prev.Speculative == e.Speculative {
+			if prev.Speculative == e.Speculative &&
+				(stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
+				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) {
 				continue
 			}
 		}
@@ -999,9 +999,11 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			a.podCache[idx].ord = podOrd
 		}
 
-		a.mruName = e.PodIdentifier
-		a.mruOrd = podOrd
-		a.hasMru = true
+		if !a.hasMru || a.mruOrd != podOrd {
+			a.mruName = e.PodIdentifier
+			a.mruOrd = podOrd
+			a.hasMru = true
+		}
 
 		s, ok := a.table.lookup(podOrd)
 		if !ok {
@@ -1015,7 +1017,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		// Resolve tier ordinal and tier name
 		var tierOrd uint32
 		var tier string
-		if e.Speculative || e.DeviceTier == SpeculativeTier {
+		if e.Speculative || stringIdentical(e.DeviceTier, SpeculativeTier) || e.DeviceTier == SpeculativeTier {
 			tier = SpeculativeTier
 			tierOrd = speculativeTierOrdinal
 		} else {
@@ -1160,6 +1162,14 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 
 	for i := range entries {
 		e := &entries[i]
+		if i > 0 {
+			prev := &entries[i-1]
+			if prev.Speculative == e.Speculative &&
+				(stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
+				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) {
+				continue
+			}
+		}
 
 		var s int32
 		var podOrd uint32
@@ -1169,9 +1179,9 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 
 		if i < 256 {
 			entry := &a.posCache256[i]
-			if (stringIdentical(entry.podName, e.PodIdentifier) || entry.podName == e.PodIdentifier) &&
-				(stringIdentical(entry.tierName, e.DeviceTier) || entry.tierName == e.DeviceTier) &&
-				entry.speculative == e.Speculative {
+			if entry.speculative == e.Speculative &&
+				(stringIdentical(entry.podName, e.PodIdentifier) || entry.podName == e.PodIdentifier) &&
+				(stringIdentical(entry.tierName, e.DeviceTier) || entry.tierName == e.DeviceTier) {
 				s := entry.slot
 				slot := &slots[s]
 				if slot.seen < keyStamp-1 {
@@ -1204,15 +1214,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						}
 					}
 				}
-				continue
-			}
-		}
-
-		if i > 0 {
-			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
-				prev.Speculative == e.Speculative {
+				if !a.hasMru || a.mruOrd != entry.podOrd {
+					a.mruName = e.PodIdentifier
+					a.mruOrd = entry.podOrd
+					a.hasMru = true
+				}
 				continue
 			}
 		}
@@ -1235,9 +1241,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				}
 			}
 			if found {
-				a.mruName = e.PodIdentifier
-				a.mruOrd = podOrd
-				a.hasMru = true
+				if !a.hasMru || a.mruOrd != podOrd {
+					a.mruName = e.PodIdentifier
+					a.mruOrd = podOrd
+					a.hasMru = true
+				}
 			}
 		}
 
@@ -1250,7 +1258,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			continue
 		}
 
-		if e.Speculative || e.DeviceTier == SpeculativeTier {
+		if e.Speculative || stringIdentical(e.DeviceTier, SpeculativeTier) || e.DeviceTier == SpeculativeTier {
 			tier = SpeculativeTier
 			tierOrd = speculativeTierOrdinal
 		} else {
@@ -1395,7 +1403,7 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 		if (a.speculativeTierChecked & (1 << ordinal)) != 0 {
 			isSpeculative = (a.speculativeTierMask & (1 << ordinal)) != 0
 		} else {
-			isSpeculative = tier == SpeculativeTier
+			isSpeculative = stringIdentical(tier, SpeculativeTier) || tier == SpeculativeTier
 			a.speculativeTierChecked |= (1 << ordinal)
 			if isSpeculative {
 				a.speculativeTierMask |= (1 << ordinal)
@@ -1429,7 +1437,7 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 		}
 	}
 	w := unknownTierWeight
-	if tier == SpeculativeTier {
+	if stringIdentical(tier, SpeculativeTier) || tier == SpeculativeTier {
 		w = speculativeTierWeight
 	}
 	if configured, ok := a.weights[tier]; ok {

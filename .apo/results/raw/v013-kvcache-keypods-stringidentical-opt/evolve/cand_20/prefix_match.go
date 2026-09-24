@@ -386,7 +386,7 @@ type prefixAccumulator struct {
 	speculativeWeight    float64
 	speculativeWeightSet bool
 
-	posCache256 [256]posCacheEntry
+	posCacheDyn []posCacheEntry
 	podCache    [2048]podCacheEntry
 	tierCache   [4]tierCacheEntry
 
@@ -417,6 +417,7 @@ var accumulatorPool = sync.Pool{New: func() any {
 		tiersMap:      make(map[string]uint32, 16),
 		refsBuf:       make([]kvblock.EntryRef, 0, 512),
 		posCache:      make([]posCacheEntryKey, 0, 512),
+		posCacheDyn:   make([]posCacheEntry, 0, 256),
 		singularCache: make(map[string][]map[string]int, 8),
 	}
 }}
@@ -453,7 +454,8 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	a.mruName = ""
 	a.lastTierName = ""
 	clear(a.podCache[:])
-	clear(a.posCache256[:])
+	clear(a.posCacheDyn)
+	a.posCacheDyn = a.posCacheDyn[:0]
 	clear(a.tierCache[:])
 	if a.singularCache == nil {
 		a.singularCache = make(map[string][]map[string]int, 8)
@@ -469,6 +471,8 @@ func releaseAccumulator(a *prefixAccumulator) {
 	for i := 0; i < len(a.slots); i++ {
 		a.slots[i].pod = ""
 	}
+	clear(a.posCacheDyn)
+	a.posCacheDyn = a.posCacheDyn[:0]
 	accumulatorPool.Put(a)
 }
 
@@ -515,14 +519,14 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 				if (a.speculativeTierChecked & (1 << ref.TierOrdinal)) != 0 {
 					isSpeculative = (a.speculativeTierMask & (1 << ref.TierOrdinal)) != 0
 				} else {
-					isSpeculative = ref.DeviceTier == SpeculativeTier
+					isSpeculative = stringIdentical(ref.DeviceTier, SpeculativeTier) || ref.DeviceTier == SpeculativeTier
 					a.speculativeTierChecked |= (1 << ref.TierOrdinal)
 					if isSpeculative {
 						a.speculativeTierMask |= (1 << ref.TierOrdinal)
 					}
 				}
 			} else {
-				isSpeculative = ref.DeviceTier == SpeculativeTier
+				isSpeculative = stringIdentical(ref.DeviceTier, SpeculativeTier) || ref.DeviceTier == SpeculativeTier
 			}
 		}
 		if isSpeculative {
@@ -712,14 +716,14 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				if (a.speculativeTierChecked & (1 << tierOrdinal)) != 0 {
 					isSpeculative = (a.speculativeTierMask & (1 << tierOrdinal)) != 0
 				} else {
-					isSpeculative = ref.DeviceTier == SpeculativeTier
+					isSpeculative = stringIdentical(ref.DeviceTier, SpeculativeTier) || ref.DeviceTier == SpeculativeTier
 					a.speculativeTierChecked |= (1 << tierOrdinal)
 					if isSpeculative {
 						a.speculativeTierMask |= (1 << tierOrdinal)
 					}
 				}
 			} else {
-				isSpeculative = ref.DeviceTier == SpeculativeTier
+				isSpeculative = stringIdentical(ref.DeviceTier, SpeculativeTier) || ref.DeviceTier == SpeculativeTier
 			}
 		}
 		if isSpeculative {
@@ -973,6 +977,13 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 	a.table.reset(len(entries))
 
+	if cap(a.posCacheDyn) < len(entries) {
+		a.posCacheDyn = make([]posCacheEntry, len(entries))
+	} else {
+		a.posCacheDyn = a.posCacheDyn[:len(entries)]
+		clear(a.posCacheDyn)
+	}
+
 	weightCacheDirect := &a.weightCacheDirect
 	weightCacheSet := a.weightCacheSet
 
@@ -980,9 +991,9 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		e := &entries[i]
 		if i > 0 {
 			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
-				prev.Speculative == e.Speculative {
+			if prev.Speculative == e.Speculative &&
+				(stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
+				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) {
 				continue
 			}
 		}
@@ -1015,7 +1026,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		// Resolve tier ordinal and tier name
 		var tierOrd uint32
 		var tier string
-		if e.Speculative || e.DeviceTier == SpeculativeTier {
+		if e.Speculative || stringIdentical(e.DeviceTier, SpeculativeTier) || e.DeviceTier == SpeculativeTier {
 			tier = SpeculativeTier
 			tierOrd = speculativeTierOrdinal
 		} else {
@@ -1130,17 +1141,15 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
-				podName:     e.PodIdentifier,
-				tierName:    e.DeviceTier,
-				speculative: e.Speculative,
-				podOrd:      podOrd,
-				tierOrd:     tierOrd,
-				slot:        s,
-				weight:      w,
-				confirmed:   tierOrd != speculativeTierOrdinal,
-			}
+		a.posCacheDyn[i] = posCacheEntry{
+			podName:     e.PodIdentifier,
+			tierName:    e.DeviceTier,
+			speculative: e.Speculative,
+			podOrd:      podOrd,
+			tierOrd:     tierOrd,
+			slot:        s,
+			weight:      w,
+			confirmed:   tierOrd != speculativeTierOrdinal,
 		}
 	}
 	a.weightCacheSet = weightCacheSet
@@ -1157,9 +1166,18 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	keyStamp := a.keyStamp
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
+	posCacheDyn := a.posCacheDyn
 
 	for i := range entries {
 		e := &entries[i]
+		if i > 0 {
+			prev := &entries[i-1]
+			if prev.Speculative == e.Speculative &&
+				(stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
+				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) {
+				continue
+			}
+		}
 
 		var s int32
 		var podOrd uint32
@@ -1167,11 +1185,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		var tier string
 		var ok bool
 
-		if i < 256 {
-			entry := &a.posCache256[i]
-			if (stringIdentical(entry.podName, e.PodIdentifier) || entry.podName == e.PodIdentifier) &&
-				(stringIdentical(entry.tierName, e.DeviceTier) || entry.tierName == e.DeviceTier) &&
-				entry.speculative == e.Speculative {
+		if i < len(posCacheDyn) {
+			entry := &posCacheDyn[i]
+			if entry.speculative == e.Speculative &&
+				(stringIdentical(entry.podName, e.PodIdentifier) || entry.podName == e.PodIdentifier) &&
+				(stringIdentical(entry.tierName, e.DeviceTier) || entry.tierName == e.DeviceTier) {
 				s := entry.slot
 				slot := &slots[s]
 				if slot.seen < keyStamp-1 {
@@ -1204,15 +1222,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						}
 					}
 				}
-				continue
-			}
-		}
-
-		if i > 0 {
-			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
-				prev.Speculative == e.Speculative {
 				continue
 			}
 		}
@@ -1250,7 +1259,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			continue
 		}
 
-		if e.Speculative || e.DeviceTier == SpeculativeTier {
+		if e.Speculative || stringIdentical(e.DeviceTier, SpeculativeTier) || e.DeviceTier == SpeculativeTier {
 			tier = SpeculativeTier
 			tierOrd = speculativeTierOrdinal
 		} else {
@@ -1335,8 +1344,8 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
+		if i < len(posCacheDyn) {
+			posCacheDyn[i] = posCacheEntry{
 				podName:     e.PodIdentifier,
 				tierName:    e.DeviceTier,
 				speculative: e.Speculative,
@@ -1395,7 +1404,7 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 		if (a.speculativeTierChecked & (1 << ordinal)) != 0 {
 			isSpeculative = (a.speculativeTierMask & (1 << ordinal)) != 0
 		} else {
-			isSpeculative = tier == SpeculativeTier
+			isSpeculative = stringIdentical(tier, SpeculativeTier) || tier == SpeculativeTier
 			a.speculativeTierChecked |= (1 << ordinal)
 			if isSpeculative {
 				a.speculativeTierMask |= (1 << ordinal)
@@ -1429,7 +1438,7 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 		}
 	}
 	w := unknownTierWeight
-	if tier == SpeculativeTier {
+	if stringIdentical(tier, SpeculativeTier) || tier == SpeculativeTier {
 		w = speculativeTierWeight
 	}
 	if configured, ok := a.weights[tier]; ok {

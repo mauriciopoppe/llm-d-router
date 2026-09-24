@@ -295,36 +295,31 @@ type tierWeight struct {
 
 // matchSlot is one candidate pod's accumulated state.
 type matchSlot struct {
-	pod     string
-	matched int
-	score   float64
-	// seen is the key stamp of the last key holding this pod; weight is the
-	// highest tier weight among its entries at that key.
-	seen   uint32
-	weight float64
-	tiers  []tierChain
-	// confirmed tracks the chain of keys held in a non-speculative tier;
-	// confirmedSeen is the key stamp of the last key holding one.
+	pod            string
+	tier0Name      string
+	score          float64
+	weight         float64
+	tiers          []tierChain
+	matched        int
 	confirmed      int
+	tier0Count     int
+	seen           uint32
 	confirmedSeen  uint32
+	tier0Ordinal   uint32
+	tier0Seen      uint32
 	confirmedAlive bool
-
-	hasTier0     bool
-	tier0Ordinal uint32
-	tier0Seen    uint32
-	tier0Count   int
-	tier0Alive   bool
-	tier0Name    string
+	hasTier0       bool
+	tier0Alive     bool
 }
 
 type posCacheEntry struct {
 	podName     string
 	tierName    string
-	speculative bool
+	weight      float64
 	podOrd      uint32
 	tierOrd     uint32
 	slot        int32
-	weight      float64
+	speculative bool
 	confirmed   bool
 }
 
