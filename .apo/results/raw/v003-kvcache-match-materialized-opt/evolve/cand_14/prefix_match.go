@@ -159,10 +159,16 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 // matchMaterialized feeds the accumulator from a Lookup result, walking keys
 // in order and stopping at the first key without entries. Pod and tier
 // ordinals are assigned per call, since materialized entries carry none.
-func fastHash(s string) uint32 {
-	h := uint32(2166136261)
-	for i := 0; i < len(s); i++ {
-		h = (h * 16777619) ^ uint32(s[i])
+func cheapHash(s string) uint32 {
+	l := len(s)
+	if l == 0 {
+		return 0
+	}
+	h := uint32(l)
+	h = h*31 + uint32(s[0])
+	h = h*31 + uint32(s[l-1])
+	if l > 2 {
+		h = h*31 + uint32(s[l>>1])
 	}
 	return h
 }
@@ -179,31 +185,14 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		ord   uint32
 		valid bool
 	}
-	var podCache [256]cacheEntry
+	var podCache [512]cacheEntry
 
-	var tierCache [4]struct {
-		name  string
-		ord   uint32
-		valid bool
+	type tierEntry struct {
+		name string
+		ord  uint32
 	}
-
-	tierOrdinalCached := func(tier string) uint32 {
-		for idx := 0; idx < 4; idx++ {
-			if !tierCache[idx].valid {
-				tierOrd := acc.tierOrdinal(tier)
-				tierCache[idx] = struct {
-					name  string
-					ord   uint32
-					valid bool
-				}{name: tier, ord: tierOrd, valid: true}
-				return tierOrd
-			}
-			if tierCache[idx].name == tier {
-				return tierCache[idx].ord
-			}
-		}
-		return acc.tierOrdinal(tier)
-	}
+	var t0, t1 tierEntry
+	var t0Valid, t1Valid bool
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
@@ -228,33 +217,9 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		if pos == 0 {
 			for i := range entries {
 				e := &entries[i]
-				podOrd := acc.podOrdinal(e.PodIdentifier)
 
-				h := fastHash(e.PodIdentifier)
-				idx := h & 255
-				for {
-					if !podCache[idx].valid {
-						podCache[idx] = cacheEntry{name: e.PodIdentifier, ord: podOrd, valid: true}
-						break
-					}
-					if podCache[idx].name == e.PodIdentifier {
-						break
-					}
-					idx = (idx + 1) & 255
-				}
-
-				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
-					PodEntry:    *e,
-					PodOrdinal:  podOrd,
-					TierOrdinal: tierOrdinalCached(e.DeviceTier),
-				})
-			}
-		} else {
-			for i := range entries {
-				e := &entries[i]
-
-				h := fastHash(e.PodIdentifier)
-				idx := h & 255
+				ch := cheapHash(e.PodIdentifier)
+				idx := ch & 511
 				var podOrd uint32
 				found := false
 				for {
@@ -266,17 +231,87 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 						found = true
 						break
 					}
-					idx = (idx + 1) & 255
+					idx = (idx + 1) & 511
+				}
+
+				if !found {
+					podOrd = acc.podOrdinal(e.PodIdentifier)
+					idx = ch & 511
+					for {
+						if !podCache[idx].valid {
+							podCache[idx] = cacheEntry{name: e.PodIdentifier, ord: podOrd, valid: true}
+							break
+						}
+						idx = (idx + 1) & 511
+					}
+				}
+
+				var tierOrd uint32
+				if t0Valid && t0.name == e.DeviceTier {
+					tierOrd = t0.ord
+				} else if t1Valid && t1.name == e.DeviceTier {
+					tierOrd = t1.ord
+				} else {
+					tierOrd = acc.tierOrdinal(e.DeviceTier)
+					if !t0Valid {
+						t0 = tierEntry{name: e.DeviceTier, ord: tierOrd}
+						t0Valid = true
+					} else if !t1Valid {
+						t1 = tierEntry{name: e.DeviceTier, ord: tierOrd}
+						t1Valid = true
+					}
+				}
+
+				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
+					PodEntry:    *e,
+					PodOrdinal:  podOrd,
+					TierOrdinal: tierOrd,
+				})
+			}
+		} else {
+			for i := range entries {
+				e := &entries[i]
+
+				ch := cheapHash(e.PodIdentifier)
+				idx := ch & 511
+				var podOrd uint32
+				found := false
+				for {
+					if !podCache[idx].valid {
+						break
+					}
+					if podCache[idx].name == e.PodIdentifier {
+						podOrd = podCache[idx].ord
+						found = true
+						break
+					}
+					idx = (idx + 1) & 511
 				}
 
 				if !found {
 					continue
 				}
 
+				var tierOrd uint32
+				if t0Valid && t0.name == e.DeviceTier {
+					tierOrd = t0.ord
+				} else if t1Valid && t1.name == e.DeviceTier {
+					tierOrd = t1.ord
+				} else {
+					tierOrd = acc.tierOrdinal(e.DeviceTier)
+					if !t0Valid {
+						t0 = tierEntry{name: e.DeviceTier, ord: tierOrd}
+						t0Valid = true
+					} else if !t1Valid {
+						t1 = tierEntry{name: e.DeviceTier, ord: tierOrd}
+						t1Valid = true
+					}
+				}
+
 				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
 					PodEntry:    *e,
 					PodOrdinal:  podOrd,
-					TierOrdinal: tierOrdinalCached(e.DeviceTier),
+					TierOrdinal: tierOrd,
 				})
 			}
 		}

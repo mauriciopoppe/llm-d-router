@@ -156,17 +156,24 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 }
 
 // EVOLVE-BLOCK-START
+type podCacheEntry struct {
+	name string
+	ord  uint32
+}
+
+func cheapHash(s string) int {
+	if len(s) == 0 {
+		return 0
+	}
+	h := uint32(len(s))
+	h = h*31 + uint32(s[0])
+	h = h*31 + uint32(s[len(s)-1])
+	return int(h & 511)
+}
+
 // matchMaterialized feeds the accumulator from a Lookup result, walking keys
 // in order and stopping at the first key without entries. Pod and tier
 // ordinals are assigned per call, since materialized entries carry none.
-func fastHash(s string) uint32 {
-	h := uint32(2166136261)
-	for i := 0; i < len(s); i++ {
-		h = (h * 16777619) ^ uint32(s[i])
-	}
-	return h
-}
-
 func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
 	weights map[string]float64, filter sets.Set[string],
@@ -174,36 +181,10 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
-	type cacheEntry struct {
-		name  string
-		ord   uint32
-		valid bool
-	}
-	var podCache [256]cacheEntry
-
-	var tierCache [4]struct {
-		name  string
-		ord   uint32
-		valid bool
-	}
-
-	tierOrdinalCached := func(tier string) uint32 {
-		for idx := 0; idx < 4; idx++ {
-			if !tierCache[idx].valid {
-				tierOrd := acc.tierOrdinal(tier)
-				tierCache[idx] = struct {
-					name  string
-					ord   uint32
-					valid bool
-				}{name: tier, ord: tierOrd, valid: true}
-				return tierOrd
-			}
-			if tierCache[idx].name == tier {
-				return tierCache[idx].ord
-			}
-		}
-		return acc.tierOrdinal(tier)
-	}
+	var podCache [512]podCacheEntry
+	var podToTier [512]uint32
+	gpuOrd, specOrd := uint32(999), uint32(999)
+	var bigBuf []kvblock.EntryRef
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
@@ -213,74 +194,96 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		if len(entries) == 0 {
 			break
 		}
-		if cap(acc.refsBuf) < len(entries) {
-			allocCap := len(entries)
-			if allocCap < 128 {
-				allocCap = 128
-			} else {
-				allocCap = allocCap * 2
+
+		if pos == 0 {
+			capEstimate := len(entries) * 64
+			if capEstimate > len(entries)*len(keys) {
+				capEstimate = len(entries) * len(keys)
 			}
-			acc.refsBuf = make([]kvblock.EntryRef, 0, allocCap)
-		} else {
-			acc.refsBuf = acc.refsBuf[:0]
+			bigBuf = make([]kvblock.EntryRef, 0, capEstimate)
 		}
+
+		startIdx := len(bigBuf)
 
 		if pos == 0 {
 			for i := range entries {
 				e := &entries[i]
-				podOrd := acc.podOrdinal(e.PodIdentifier)
-
-				h := fastHash(e.PodIdentifier)
-				idx := h & 255
+				name := e.PodIdentifier
+				
+				h := cheapHash(name)
+				var ord uint32
 				for {
-					if !podCache[idx].valid {
-						podCache[idx] = cacheEntry{name: e.PodIdentifier, ord: podOrd, valid: true}
+					if podCache[h].name == "" {
+						ord = acc.podOrdinal(name)
+						podCache[h] = podCacheEntry{name: name, ord: ord}
 						break
 					}
-					if podCache[idx].name == e.PodIdentifier {
+					if podCache[h].name == name {
+						ord = podCache[h].ord
 						break
 					}
-					idx = (idx + 1) & 255
+					h = (h + 1) & 511
 				}
 
-				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
+				tier := e.DeviceTier
+				var tOrd uint32
+				if tier == "gpu" {
+					if gpuOrd == 999 {
+						gpuOrd = acc.tierOrdinal(tier)
+					}
+					tOrd = gpuOrd
+				} else if tier == "speculative" {
+					if specOrd == 999 {
+						specOrd = acc.tierOrdinal(tier)
+					}
+					tOrd = specOrd
+				} else {
+					tOrd = acc.tierOrdinal(tier)
+				}
+
+				podToTier[ord] = tOrd
+
+				bigBuf = append(bigBuf, kvblock.EntryRef{
 					PodEntry:    *e,
-					PodOrdinal:  podOrd,
-					TierOrdinal: tierOrdinalCached(e.DeviceTier),
+					PodOrdinal:  ord,
+					TierOrdinal: tOrd,
 				})
 			}
 		} else {
 			for i := range entries {
 				e := &entries[i]
-
-				h := fastHash(e.PodIdentifier)
-				idx := h & 255
-				var podOrd uint32
+				name := e.PodIdentifier
+				
+				h := cheapHash(name)
+				var ord uint32
 				found := false
 				for {
-					if !podCache[idx].valid {
+					if podCache[h].name == "" {
 						break
 					}
-					if podCache[idx].name == e.PodIdentifier {
-						podOrd = podCache[idx].ord
+					if podCache[h].name == name {
+						ord = podCache[h].ord
 						found = true
 						break
 					}
-					idx = (idx + 1) & 255
+					h = (h + 1) & 511
 				}
 
 				if !found {
 					continue
 				}
 
-				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
+				tOrd := podToTier[ord]
+
+				bigBuf = append(bigBuf, kvblock.EntryRef{
 					PodEntry:    *e,
-					PodOrdinal:  podOrd,
-					TierOrdinal: tierOrdinalCached(e.DeviceTier),
+					PodOrdinal:  ord,
+					TierOrdinal: tOrd,
 				})
 			}
 		}
 
+		acc.refsBuf = bigBuf[startIdx:len(bigBuf):len(bigBuf)]
 		if !acc.key(acc.refsBuf) {
 			break
 		}
@@ -298,15 +301,30 @@ func (a *prefixAccumulator) podOrdinal(name string) uint32 {
 		return id
 	}
 	id := uint32(len(a.podsMap))
+	if a.podsMap == nil {
+		a.podsMap = make(map[string]uint32, 128)
+	}
 	a.podsMap[name] = id
 	return id
 }
 
 func (a *prefixAccumulator) tierOrdinal(name string) uint32 {
+	if name == "gpu" {
+		if id, ok := a.tiersMap["gpu"]; ok {
+			return id
+		}
+	} else if name == "speculative" {
+		if id, ok := a.tiersMap["speculative"]; ok {
+			return id
+		}
+	}
 	if id, ok := a.tiersMap[name]; ok {
 		return id
 	}
 	id := uint32(len(a.tiersMap))
+	if a.tiersMap == nil {
+		a.tiersMap = make(map[string]uint32, 4)
+	}
 	a.tiersMap[name] = id
 	return id
 }

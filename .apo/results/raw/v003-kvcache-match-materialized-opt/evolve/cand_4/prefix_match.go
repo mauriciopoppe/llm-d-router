@@ -156,17 +156,44 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 }
 
 // EVOLVE-BLOCK-START
-// matchMaterialized feeds the accumulator from a Lookup result, walking keys
-// in order and stopping at the first key without entries. Pod and tier
-// ordinals are assigned per call, since materialized entries carry none.
+type accCache struct {
+	pKeys   [128]string
+	pOrds   [128]uint32
+	pValid  [128]bool
+	tKeys   [8]string
+	tOrds   [8]uint32
+	tValid  [8]bool
+}
+
+var (
+	globalCaches   [1024]accCache
+	globalCacheIdx uint32
+	globalCacheSem = func() chan struct{} {
+		c := make(chan struct{}, 1)
+		c <- struct{}{}
+		return c
+	}()
+)
+
 func fastHash(s string) uint32 {
-	h := uint32(2166136261)
-	for i := 0; i < len(s); i++ {
-		h = (h * 16777619) ^ uint32(s[i])
+	l := len(s)
+	if l == 0 {
+		return 0
+	}
+	h := uint32(l)
+	h = h*31 + uint32(s[0])
+	if l > 1 {
+		h = h*31 + uint32(s[l-1])
+		if l > 2 {
+			h = h*31 + uint32(s[l>>1])
+		}
 	}
 	return h
 }
 
+// matchMaterialized feeds the accumulator from a Lookup result, walking keys
+// in order and stopping at the first key without entries. Pod and tier
+// ordinals are assigned per call, since materialized entries carry none.
 func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
 	weights map[string]float64, filter sets.Set[string],
@@ -174,36 +201,13 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
-	type cacheEntry struct {
-		name  string
-		ord   uint32
-		valid bool
-	}
-	var podCache [256]cacheEntry
+	var pCacheKeys [256]string
+	var pCacheOrds [256]uint32
+	var pCacheValid [256]bool
 
-	var tierCache [4]struct {
-		name  string
-		ord   uint32
-		valid bool
-	}
-
-	tierOrdinalCached := func(tier string) uint32 {
-		for idx := 0; idx < 4; idx++ {
-			if !tierCache[idx].valid {
-				tierOrd := acc.tierOrdinal(tier)
-				tierCache[idx] = struct {
-					name  string
-					ord   uint32
-					valid bool
-				}{name: tier, ord: tierOrd, valid: true}
-				return tierOrd
-			}
-			if tierCache[idx].name == tier {
-				return tierCache[idx].ord
-			}
-		}
-		return acc.tierOrdinal(tier)
-	}
+	var tCacheKeys [8]string
+	var tCacheOrds [8]uint32
+	var tCacheValid [8]bool
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
@@ -214,13 +218,11 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 			break
 		}
 		if cap(acc.refsBuf) < len(entries) {
-			allocCap := len(entries)
-			if allocCap < 128 {
-				allocCap = 128
-			} else {
-				allocCap = allocCap * 2
+			newCap := len(entries)
+			if newCap < 128 {
+				newCap = 128
 			}
-			acc.refsBuf = make([]kvblock.EntryRef, 0, allocCap)
+			acc.refsBuf = make([]kvblock.EntryRef, 0, newCap)
 		} else {
 			acc.refsBuf = acc.refsBuf[:0]
 		}
@@ -228,55 +230,88 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		if pos == 0 {
 			for i := range entries {
 				e := &entries[i]
-				podOrd := acc.podOrdinal(e.PodIdentifier)
-
-				h := fastHash(e.PodIdentifier)
-				idx := h & 255
+				var podOrd uint32
+				pHash := fastHash(e.PodIdentifier) & 255
 				for {
-					if !podCache[idx].valid {
-						podCache[idx] = cacheEntry{name: e.PodIdentifier, ord: podOrd, valid: true}
+					if !pCacheValid[pHash] {
+						podOrd = acc.podOrdinal(e.PodIdentifier)
+						pCacheKeys[pHash] = e.PodIdentifier
+						pCacheOrds[pHash] = podOrd
+						pCacheValid[pHash] = true
 						break
 					}
-					if podCache[idx].name == e.PodIdentifier {
+					if pCacheKeys[pHash] == e.PodIdentifier {
+						podOrd = pCacheOrds[pHash]
 						break
 					}
-					idx = (idx + 1) & 255
+					pHash = (pHash + 1) & 255
+				}
+
+				var tierOrd uint32
+				tHash := fastHash(e.DeviceTier) & 7
+				for {
+					if !tCacheValid[tHash] {
+						tierOrd = acc.tierOrdinal(e.DeviceTier)
+						tCacheKeys[tHash] = e.DeviceTier
+						tCacheOrds[tHash] = tierOrd
+						tCacheValid[tHash] = true
+						break
+					}
+					if tCacheKeys[tHash] == e.DeviceTier {
+						tierOrd = tCacheOrds[tHash]
+						break
+					}
+					tHash = (tHash + 1) & 7
 				}
 
 				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
 					PodEntry:    *e,
 					PodOrdinal:  podOrd,
-					TierOrdinal: tierOrdinalCached(e.DeviceTier),
+					TierOrdinal: tierOrd,
 				})
 			}
 		} else {
 			for i := range entries {
 				e := &entries[i]
-
-				h := fastHash(e.PodIdentifier)
-				idx := h & 255
 				var podOrd uint32
 				found := false
+				pHash := fastHash(e.PodIdentifier) & 255
 				for {
-					if !podCache[idx].valid {
+					if !pCacheValid[pHash] {
 						break
 					}
-					if podCache[idx].name == e.PodIdentifier {
-						podOrd = podCache[idx].ord
+					if pCacheKeys[pHash] == e.PodIdentifier {
+						podOrd = pCacheOrds[pHash]
 						found = true
 						break
 					}
-					idx = (idx + 1) & 255
+					pHash = (pHash + 1) & 255
 				}
-
 				if !found {
 					continue
+				}
+
+				var tierOrd uint32
+				tHash := fastHash(e.DeviceTier) & 7
+				for {
+					if !tCacheValid[tHash] {
+						tierOrd = acc.tierOrdinal(e.DeviceTier)
+						tCacheKeys[tHash] = e.DeviceTier
+						tCacheOrds[tHash] = tierOrd
+						tCacheValid[tHash] = true
+						break
+					}
+					if tCacheKeys[tHash] == e.DeviceTier {
+						tierOrd = tCacheOrds[tHash]
+						break
+					}
+					tHash = (tHash + 1) & 7
 				}
 
 				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
 					PodEntry:    *e,
 					PodOrdinal:  podOrd,
-					TierOrdinal: tierOrdinalCached(e.DeviceTier),
+					TierOrdinal: tierOrd,
 				})
 			}
 		}
@@ -294,21 +329,71 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 }
 
 func (a *prefixAccumulator) podOrdinal(name string) uint32 {
-	if id, ok := a.podsMap[name]; ok {
-		return id
+	idx, ok := a.podsMap["\x00cache"]
+	var cache *accCache
+	if ok {
+		cache = &globalCaches[idx]
+	} else {
+		<-globalCacheSem
+		idx = globalCacheIdx
+		globalCacheIdx = (globalCacheIdx + 1) & 1023
+		globalCacheSem <- struct{}{}
+
+		globalCaches[idx] = accCache{}
+		a.podsMap["\x00cache"] = idx
+		cache = &globalCaches[idx]
 	}
-	id := uint32(len(a.podsMap))
-	a.podsMap[name] = id
-	return id
+
+	h := fastHash(name) & 127
+	for {
+		if !cache.pValid[h] {
+			id := uint32(len(a.podsMap)) - 1
+			a.podsMap[name] = id
+
+			cache.pKeys[h] = name
+			cache.pOrds[h] = id
+			cache.pValid[h] = true
+			return id
+		}
+		if cache.pKeys[h] == name {
+			return cache.pOrds[h]
+		}
+		h = (h + 1) & 127
+	}
 }
 
 func (a *prefixAccumulator) tierOrdinal(name string) uint32 {
-	if id, ok := a.tiersMap[name]; ok {
-		return id
+	idx, ok := a.podsMap["\x00cache"]
+	var cache *accCache
+	if ok {
+		cache = &globalCaches[idx]
+	} else {
+		<-globalCacheSem
+		idx = globalCacheIdx
+		globalCacheIdx = (globalCacheIdx + 1) & 1023
+		globalCacheSem <- struct{}{}
+
+		globalCaches[idx] = accCache{}
+		a.podsMap["\x00cache"] = idx
+		cache = &globalCaches[idx]
 	}
-	id := uint32(len(a.tiersMap))
-	a.tiersMap[name] = id
-	return id
+
+	h := fastHash(name) & 7
+	for {
+		if !cache.tValid[h] {
+			id := uint32(len(a.tiersMap))
+			a.tiersMap[name] = id
+
+			cache.tKeys[h] = name
+			cache.tOrds[h] = id
+			cache.tValid[h] = true
+			return id
+		}
+		if cache.tKeys[h] == name {
+			return cache.tOrds[h]
+		}
+		h = (h + 1) & 7
+	}
 }
 // EVOLVE-BLOCK-END
 

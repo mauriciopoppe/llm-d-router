@@ -159,14 +159,6 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 // matchMaterialized feeds the accumulator from a Lookup result, walking keys
 // in order and stopping at the first key without entries. Pod and tier
 // ordinals are assigned per call, since materialized entries carry none.
-func fastHash(s string) uint32 {
-	h := uint32(2166136261)
-	for i := 0; i < len(s); i++ {
-		h = (h * 16777619) ^ uint32(s[i])
-	}
-	return h
-}
-
 func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
 	weights map[string]float64, filter sets.Set[string],
@@ -174,36 +166,16 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
-	type cacheEntry struct {
-		name  string
-		ord   uint32
-		valid bool
+	type knownPod struct {
+		name string
+		ord  uint32
 	}
-	var podCache [256]cacheEntry
+	var knownPodsBuf [128]knownPod
+	knownPods := knownPodsBuf[:0]
 
-	var tierCache [4]struct {
-		name  string
-		ord   uint32
-		valid bool
-	}
-
-	tierOrdinalCached := func(tier string) uint32 {
-		for idx := 0; idx < 4; idx++ {
-			if !tierCache[idx].valid {
-				tierOrd := acc.tierOrdinal(tier)
-				tierCache[idx] = struct {
-					name  string
-					ord   uint32
-					valid bool
-				}{name: tier, ord: tierOrd, valid: true}
-				return tierOrd
-			}
-			if tierCache[idx].name == tier {
-				return tierCache[idx].ord
-			}
-		}
-		return acc.tierOrdinal(tier)
-	}
+	var gpuOrdinal uint32 = 0xffffffff
+	var speculativeOrdinal uint32 = 0xffffffff
+	var hasGPU, hasSpeculative bool
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
@@ -213,74 +185,79 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		if len(entries) == 0 {
 			break
 		}
-		if cap(acc.refsBuf) < len(entries) {
-			allocCap := len(entries)
-			if allocCap < 128 {
-				allocCap = 128
-			} else {
-				allocCap = allocCap * 2
+		needed := len(entries)
+		if cap(acc.refsBuf) < needed {
+			allocSize := needed
+			if allocSize < 128 {
+				allocSize = 128
 			}
-			acc.refsBuf = make([]kvblock.EntryRef, 0, allocCap)
+			acc.refsBuf = make([]kvblock.EntryRef, 0, allocSize)
 		} else {
 			acc.refsBuf = acc.refsBuf[:0]
 		}
+		for i := range entries {
+			e := &entries[i]
 
-		if pos == 0 {
-			for i := range entries {
-				e := &entries[i]
-				podOrd := acc.podOrdinal(e.PodIdentifier)
+			var podOrd uint32
+			var found bool
 
-				h := fastHash(e.PodIdentifier)
-				idx := h & 255
-				for {
-					if !podCache[idx].valid {
-						podCache[idx] = cacheEntry{name: e.PodIdentifier, ord: podOrd, valid: true}
-						break
+			if len(knownPods) > 0 {
+				if knownPods[0].name == e.PodIdentifier {
+					podOrd = knownPods[0].ord
+					found = true
+				} else if len(knownPods) > 1 && knownPods[1].name == e.PodIdentifier {
+					podOrd = knownPods[1].ord
+					found = true
+					knownPods[0], knownPods[1] = knownPods[1], knownPods[0]
+				} else {
+					for j := 2; j < len(knownPods); j++ {
+						if knownPods[j].name == e.PodIdentifier {
+							podOrd = knownPods[j].ord
+							found = true
+							tmp := knownPods[j]
+							copy(knownPods[1:j+1], knownPods[0:j])
+							knownPods[0] = tmp
+							break
+						}
 					}
-					if podCache[idx].name == e.PodIdentifier {
-						break
-					}
-					idx = (idx + 1) & 255
 				}
-
-				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
-					PodEntry:    *e,
-					PodOrdinal:  podOrd,
-					TierOrdinal: tierOrdinalCached(e.DeviceTier),
-				})
 			}
-		} else {
-			for i := range entries {
-				e := &entries[i]
 
-				h := fastHash(e.PodIdentifier)
-				idx := h & 255
-				var podOrd uint32
-				found := false
-				for {
-					if !podCache[idx].valid {
-						break
-					}
-					if podCache[idx].name == e.PodIdentifier {
-						podOrd = podCache[idx].ord
-						found = true
-						break
-					}
-					idx = (idx + 1) & 255
-				}
-
-				if !found {
+			if !found {
+				if pos > 0 {
 					continue
 				}
-
-				acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
-					PodEntry:    *e,
-					PodOrdinal:  podOrd,
-					TierOrdinal: tierOrdinalCached(e.DeviceTier),
-				})
+				podOrd = acc.podOrdinal(e.PodIdentifier)
+				knownPods = append(knownPods, knownPod{name: e.PodIdentifier, ord: podOrd})
 			}
-		}
 
+			var tierOrd uint32
+			if e.DeviceTier == "gpu" {
+				if hasGPU {
+					tierOrd = gpuOrdinal
+				} else {
+					gpuOrdinal = acc.tierOrdinal("gpu")
+					hasGPU = true
+					tierOrd = gpuOrdinal
+				}
+			} else if e.DeviceTier == "speculative" {
+				if hasSpeculative {
+					tierOrd = speculativeOrdinal
+				} else {
+					speculativeOrdinal = acc.tierOrdinal("speculative")
+					hasSpeculative = true
+					tierOrd = speculativeOrdinal
+				}
+			} else {
+				tierOrd = acc.tierOrdinal(e.DeviceTier)
+			}
+
+			acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
+				PodEntry:    *e,
+				PodOrdinal:  podOrd,
+				TierOrdinal: tierOrd,
+			})
+		}
 		if !acc.key(acc.refsBuf) {
 			break
 		}
