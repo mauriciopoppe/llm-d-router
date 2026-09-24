@@ -158,13 +158,17 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 // EVOLVE-BLOCK-START
 func fastHash(s string) uint32 {
 	n := len(s)
-	if n < 2 {
-		if n == 1 {
-			return uint32(s[0])
+	if n < 4 {
+		if n == 0 {
+			return 0
 		}
-		return 0
+		h := uint32(s[0])
+		for i := 1; i < n; i++ {
+			h = h*31 + uint32(s[i])
+		}
+		return h
 	}
-	return uint32(s[n-1])*31 + uint32(s[n-2])
+	return uint32(s[0])*50625 + uint32(s[n/2])*1351 + uint32(s[n-2])*31 + uint32(s[n-1])
 }
 
 func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
@@ -371,11 +375,13 @@ type prefixAccumulator struct {
 	mru                  uint64
 	weightCacheDirect    [64]float64
 	weightCacheSet       uint64
+	speculativeTierMask    uint64
+	speculativeTierChecked uint64
 	speculativeWeight    float64
 	speculativeWeightSet bool
 
 	posCache256 [256]posCacheEntry
-	podCache    [1024]podCacheEntry
+	podCache    [2048]podCacheEntry
 	tierCache   [4]tierCacheEntry
 
 	mruName      string
@@ -432,6 +438,8 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	a.refsBuf = a.refsBuf[:0]
 	a.mru = ^uint64(0)
 	a.weightCacheSet = 0
+	a.speculativeTierMask = 0
+	a.speculativeTierChecked = 0
 	a.speculativeWeightSet = false
 
 	a.hasMru = false
@@ -495,7 +503,23 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 		slot := &a.slots[s]
 
 		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
-		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
+		isSpeculative := ref.Speculative
+		if !isSpeculative {
+			if ref.TierOrdinal < 64 {
+				if (a.speculativeTierChecked & (1 << ref.TierOrdinal)) != 0 {
+					isSpeculative = (a.speculativeTierMask & (1 << ref.TierOrdinal)) != 0
+				} else {
+					isSpeculative = ref.DeviceTier == SpeculativeTier
+					a.speculativeTierChecked |= (1 << ref.TierOrdinal)
+					if isSpeculative {
+						a.speculativeTierMask |= (1 << ref.TierOrdinal)
+					}
+				}
+			} else {
+				isSpeculative = ref.DeviceTier == SpeculativeTier
+			}
+		}
+		if isSpeculative {
 			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
 		} else {
 			slot.confirmedSeen = a.keyStamp
@@ -676,7 +700,23 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		}
 
 		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
-		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
+		isSpeculative := ref.Speculative
+		if !isSpeculative {
+			if tierOrdinal < 64 {
+				if (a.speculativeTierChecked & (1 << tierOrdinal)) != 0 {
+					isSpeculative = (a.speculativeTierMask & (1 << tierOrdinal)) != 0
+				} else {
+					isSpeculative = ref.DeviceTier == SpeculativeTier
+					a.speculativeTierChecked |= (1 << tierOrdinal)
+					if isSpeculative {
+						a.speculativeTierMask |= (1 << tierOrdinal)
+					}
+				}
+			} else {
+				isSpeculative = ref.DeviceTier == SpeculativeTier
+			}
+		}
+		if isSpeculative {
 			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
 		} else {
 			slot.confirmedSeen = keyStamp
@@ -868,7 +908,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		// Resolve pod ordinal
 		var podOrd uint32
 		h := fastHash(e.PodIdentifier)
-		idx := h & 1023
+		idx := h & 2047
 		if a.podCache[idx].name == e.PodIdentifier {
 			podOrd = a.podCache[idx].ord
 		} else {
@@ -1099,7 +1139,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			found = true
 		} else {
 			h := fastHash(e.PodIdentifier)
-			idx := h & 1023
+			idx := h & 2047
 			if a.podCache[idx].name == e.PodIdentifier {
 				podOrd = a.podCache[idx].ord
 				found = true
@@ -1267,8 +1307,18 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 		if (a.weightCacheSet & (1 << ordinal)) != 0 {
 			return a.weightCacheDirect[ordinal]
 		}
+		var isSpeculative bool
+		if (a.speculativeTierChecked & (1 << ordinal)) != 0 {
+			isSpeculative = (a.speculativeTierMask & (1 << ordinal)) != 0
+		} else {
+			isSpeculative = tier == SpeculativeTier
+			a.speculativeTierChecked |= (1 << ordinal)
+			if isSpeculative {
+				a.speculativeTierMask |= (1 << ordinal)
+			}
+		}
 		w := unknownTierWeight
-		if tier == SpeculativeTier {
+		if isSpeculative {
 			w = speculativeTierWeight
 		} else if configured, ok := a.weights[tier]; ok {
 			w = configured

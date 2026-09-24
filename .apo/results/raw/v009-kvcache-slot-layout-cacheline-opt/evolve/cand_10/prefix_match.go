@@ -285,26 +285,32 @@ type tierWeight struct {
 
 // matchSlot is one candidate pod's accumulated state.
 type matchSlot struct {
-	pod     string
-	matched int
-	score   float64
-	// seen is the key stamp of the last key holding this pod; weight is the
-	// highest tier weight among its entries at that key.
-	seen   uint32
-	weight float64
-	tiers  []tierChain
-	// confirmed tracks the chain of keys held in a non-speculative tier;
-	// confirmedSeen is the key stamp of the last key holding one.
-	confirmed      int
-	confirmedSeen  uint32
-	confirmedAlive bool
+	// Hot fields packed into 64 bytes (1 cache line)
+	weight         float64 // 8 bytes
+	score          float64 // 8 bytes
+	seen           uint32  // 4 bytes
+	confirmedSeen  uint32  // 4 bytes
+	matched        int32   // 4 bytes
+	confirmed      int32   // 4 bytes
+	confirmedAlive bool    // 1 byte
+	numTiers       uint8   // 1 byte
+	_              [2]byte // 2 bytes padding to align to 8 bytes
 
-	hasTier0     bool
-	tier0Ordinal uint32
-	tier0Seen    uint32
-	tier0Count   int
-	tier0Alive   bool
-	tier0Name    string
+	tier0Ord   uint32  // 4 bytes
+	tier0Seen  uint32  // 4 bytes
+	tier0Count int32   // 4 bytes
+	tier0Alive bool    // 1 byte
+	_              [3]byte // 3 bytes padding
+	tier0Name  string  // 16 bytes
+
+	tier1Ord   uint32  // 4 bytes
+	tier1Seen  uint32  // 4 bytes
+	tier1Count int32   // 4 bytes
+	tier1Alive bool    // 1 byte
+	_              [3]byte // 3 bytes padding
+	tier1Name  string  // 16 bytes
+
+	pod string // 16 bytes
 }
 
 type posCacheEntry struct {
@@ -319,13 +325,11 @@ type posCacheEntry struct {
 }
 
 type posCacheEntryKey struct {
-	podOrd         uint32
-	slot           int32
-	weight         float64
-	confirmed      bool
-	tierOrd        uint32
-	rawTierOrd     uint32
-	refSpeculative bool
+	podOrd    uint32
+	slot      int32
+	weight    float64
+	confirmed bool
+	tierOrd   uint32
 }
 
 type podCacheEntry struct {
@@ -393,9 +397,6 @@ type prefixAccumulator struct {
 
 var accumulatorPool = sync.Pool{New: func() any {
 	slots := make([]matchSlot, 256)
-	for i := range slots {
-		slots[i].tiers = make([]tierChain, 0, 4)
-	}
 	return &prefixAccumulator{
 		table:         slotTable{buckets: make([]uint64, 512)},
 		slots:         slots[:0],
@@ -454,6 +455,8 @@ func releaseAccumulator(a *prefixAccumulator) {
 	a.weights, a.filter = nil, nil
 	for i := 0; i < len(a.slots); i++ {
 		a.slots[i].pod = ""
+		a.slots[i].tier0Name = ""
+		a.slots[i].tier1Name = ""
 	}
 	accumulatorPool.Put(a)
 }
@@ -473,15 +476,14 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	weightCacheDirect := &a.weightCacheDirect
 	weightCacheSet := a.weightCacheSet
 
+	var prev *kvblock.EntryRef
 	for i := range entries {
 		ref := &entries[i]
-		if i > 0 {
-			prev := &entries[i-1]
-			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
-				ref.Speculative == prev.Speculative {
-				continue
-			}
+		if prev != nil && ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
+			ref.Speculative == prev.Speculative {
+			continue
 		}
+		prev = ref
 
 		s, ok := a.table.lookup(ref.PodOrdinal)
 		if !ok {
@@ -522,66 +524,31 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 			slot.weight = w
 		}
 
-		// stampTier inline in keyFirst
-		stamped := false
-		if len(slot.tiers) == 0 {
-			if slot.hasTier0 {
-				if slot.tier0Ordinal == tierOrdinal {
-					slot.tier0Seen = a.keyStamp
-					stamped = true
-				} else {
-					// Fallback to multi-tier
-					slot.tiers = append(slot.tiers, tierChain{
-						ordinal: slot.tier0Ordinal,
-						name:    slot.tier0Name,
-						count:   slot.tier0Count,
-						seen:    slot.tier0Seen,
-						alive:   slot.tier0Alive,
-					})
-					slot.tiers = append(slot.tiers, tierChain{
-						ordinal: tierOrdinal,
-						name:    tier,
-						seen:    a.keyStamp,
-						alive:   true,
-					})
-					stamped = true
-				}
-			} else {
-				slot.hasTier0 = true
-				slot.tier0Ordinal = tierOrdinal
+		if !a.stampTier(slot, tierOrdinal) {
+			if slot.numTiers == 0 {
+				slot.tier0Ord = tierOrdinal
 				slot.tier0Name = tier
 				slot.tier0Seen = a.keyStamp
+				slot.tier0Count = 1
 				slot.tier0Alive = true
-				stamped = true
-			}
-		} else {
-			// Multi-tier path
-			for t := range slot.tiers {
-				if slot.tiers[t].ordinal == tierOrdinal {
-					slot.tiers[t].seen = a.keyStamp
-					stamped = true
-					break
-				}
-			}
-			if !stamped {
-				slot.tiers = append(slot.tiers, tierChain{
-					ordinal: tierOrdinal,
-					name:    tier,
-					seen:    a.keyStamp,
-					alive:   true,
-				})
+				slot.numTiers = 1
+			} else if slot.numTiers == 1 {
+				slot.tier1Ord = tierOrdinal
+				slot.tier1Name = tier
+				slot.tier1Seen = a.keyStamp
+				slot.tier1Count = 1
+				slot.tier1Alive = true
+				slot.numTiers = 2
 			}
 		}
 
 		if i < len(a.posCache) {
 			a.posCache[i] = posCacheEntryKey{
-				podOrd:         ref.PodOrdinal,
-				slot:           s,
-				weight:         w,
-				confirmed:      tierOrdinal != speculativeTierOrdinal,
-				tierOrd:        tierOrdinal,
-				rawTierOrd:     ref.TierOrdinal,
-				refSpeculative: ref.Speculative,
+				podOrd:    ref.PodOrdinal,
+				slot:      s,
+				weight:    w,
+				confirmed: tierOrdinal != speculativeTierOrdinal,
+				tierOrd:   tierOrdinal,
 			}
 		}
 	}
@@ -604,21 +571,24 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
+	var prev *kvblock.EntryRef
 	for i := range entries {
 		ref := &entries[i]
 		// Another rank of an endpoint just folded at this key adds nothing
 		// to its chains.
-		if i > 0 {
-			prev := &entries[i-1]
-			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
-				ref.Speculative == prev.Speculative {
-				continue
-			}
+		if prev != nil && ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
+			ref.Speculative == prev.Speculative {
+			continue
 		}
+		prev = ref
 
 		if i < len(posCache) {
 			entry := &posCache[i]
-			if entry.podOrd == ref.PodOrdinal && entry.rawTierOrd == ref.TierOrdinal && entry.refSpeculative == ref.Speculative {
+			expectedTierOrd := ref.TierOrdinal
+			if ref.Speculative || ref.DeviceTier == SpeculativeTier {
+				expectedTierOrd = speculativeTierOrdinal
+			}
+			if entry.podOrd == ref.PodOrdinal && entry.tierOrd == expectedTierOrd {
 				s := entry.slot
 				slot := &slots[s]
 				if slot.seen < keyStamp-1 {
@@ -635,20 +605,11 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 					slot.weight = w
 				}
 				// stampTier inline
-				if len(slot.tiers) == 0 {
-					if slot.hasTier0 && slot.tier0Ordinal == entry.tierOrd {
+				if slot.numTiers > 0 {
+					if slot.tier0Ord == entry.tierOrd {
 						slot.tier0Seen = keyStamp
-					}
-				} else {
-					if slot.tiers[0].ordinal == entry.tierOrd {
-						slot.tiers[0].seen = keyStamp
-					} else {
-						for t := 1; t < len(slot.tiers); t++ {
-							if slot.tiers[t].ordinal == entry.tierOrd {
-								slot.tiers[t].seen = keyStamp
-								break
-							}
-						}
+					} else if slot.numTiers > 1 && slot.tier1Ord == entry.tierOrd {
+						slot.tier1Seen = keyStamp
 					}
 				}
 				continue
@@ -704,32 +665,21 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		}
 
 		// stampTier inline
-		if len(slot.tiers) == 0 {
-			if slot.hasTier0 && slot.tier0Ordinal == tierOrdinal {
+		if slot.numTiers > 0 {
+			if slot.tier0Ord == tierOrdinal {
 				slot.tier0Seen = keyStamp
-			}
-		} else {
-			if slot.tiers[0].ordinal == tierOrdinal {
-				slot.tiers[0].seen = keyStamp
-			} else {
-				for t := 1; t < len(slot.tiers); t++ {
-					if slot.tiers[t].ordinal == tierOrdinal {
-						slot.tiers[t].seen = keyStamp
-						break
-					}
-				}
+			} else if slot.numTiers > 1 && slot.tier1Ord == tierOrdinal {
+				slot.tier1Seen = keyStamp
 			}
 		}
 
 		if i < len(posCache) {
 			posCache[i] = posCacheEntryKey{
-				podOrd:         ref.PodOrdinal,
-				slot:           s,
-				weight:         w,
-				confirmed:      tierOrdinal != speculativeTierOrdinal,
-				tierOrd:        tierOrdinal,
-				rawTierOrd:     ref.TierOrdinal,
-				refSpeculative: ref.Speculative,
+				podOrd:    ref.PodOrdinal,
+				slot:      s,
+				weight:    w,
+				confirmed: tierOrdinal != speculativeTierOrdinal,
+				tierOrd:   tierOrdinal,
 			}
 		}
 	}
@@ -738,6 +688,23 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	return a.endKey()
 }
 
+// stampTier marks tier as held at the current key and reports whether the
+// slot tracks that tier.
+func (a *prefixAccumulator) stampTier(slot *matchSlot, tierOrdinal uint32) bool {
+	if slot.numTiers > 0 {
+		if slot.tier0Ord == tierOrdinal {
+			slot.tier0Seen = a.keyStamp
+			return true
+		}
+		if slot.numTiers > 1 {
+			if slot.tier1Ord == tierOrdinal {
+				slot.tier1Seen = a.keyStamp
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // endKey closes the current key and reports whether any chain is still
 // alive.
@@ -752,13 +719,10 @@ func (a *prefixAccumulator) endKey() bool {
 			if s.confirmedSeen == keyStamp {
 				s.confirmed, s.confirmedAlive = 1, true
 			}
-			if len(s.tiers) == 0 {
-				if s.hasTier0 {
-					s.tier0Count = 1
-				}
-			} else {
-				for t := range s.tiers {
-					s.tiers[t].count = 1
+			if s.numTiers > 0 {
+				s.tier0Count = 1
+				if s.numTiers > 1 {
+					s.tier1Count = 1
 				}
 			}
 			a.active = append(a.active, int32(i))
@@ -781,22 +745,20 @@ func (a *prefixAccumulator) endKey() bool {
 				s.confirmedAlive = false
 			}
 		}
-		if len(s.tiers) == 0 {
-			if s.hasTier0 && s.tier0Alive {
+		if s.numTiers > 0 {
+			if s.tier0Alive {
 				if s.tier0Seen == keyStamp {
 					s.tier0Count++
 				} else {
 					s.tier0Alive = false
 				}
 			}
-		} else {
-			for t := range s.tiers {
-				tc := &s.tiers[t]
-				if tc.alive {
-					if tc.seen == keyStamp {
-						tc.count++
+			if s.numTiers > 1 {
+				if s.tier1Alive {
+					if s.tier1Seen == keyStamp {
+						s.tier1Count++
 					} else {
-						tc.alive = false
+						s.tier1Alive = false
 					}
 				}
 			}
@@ -813,39 +775,41 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 	for i := range a.slots {
 		s := &a.slots[i]
 		var byTier map[string]int
-		if len(s.tiers) == 0 {
-			if s.hasTier0 {
-				if s.tier0Name == a.lastSingularName && s.tier0Count == a.lastSingularCount {
+		n := int(s.numTiers)
+		if n > 0 {
+			if n == 1 {
+				tier0Name := s.tier0Name
+				tier0Count := int(s.tier0Count)
+				if tier0Name == a.lastSingularName && tier0Count == a.lastSingularCount {
 					byTier = a.lastSingularMap
 				} else {
-					slice := a.singularCache[s.tier0Name]
-					if s.tier0Count < len(slice) && slice[s.tier0Count] != nil {
-						byTier = slice[s.tier0Count]
+					slice := a.singularCache[tier0Name]
+					if tier0Count < len(slice) && slice[tier0Count] != nil {
+						byTier = slice[tier0Count]
 					} else {
-						if s.tier0Count >= len(slice) {
-							newSlice := make([]map[string]int, s.tier0Count+64)
+						if tier0Count >= len(slice) {
+							newSlice := make([]map[string]int, tier0Count+64)
 							copy(newSlice, slice)
 							slice = newSlice
-							a.singularCache[s.tier0Name] = slice
+							a.singularCache[tier0Name] = slice
 						}
-						m := map[string]int{s.tier0Name: s.tier0Count}
-						slice[s.tier0Count] = m
+						m := map[string]int{tier0Name: tier0Count}
+						slice[tier0Count] = m
 						byTier = m
 					}
-					a.lastSingularName = s.tier0Name
-					a.lastSingularCount = s.tier0Count
+					a.lastSingularName = tier0Name
+					a.lastSingularCount = tier0Count
 					a.lastSingularMap = byTier
 				}
-			}
-		} else {
-			n := len(s.tiers)
-			byTier = make(map[string]int, n)
-			for j := 0; j < n; j++ {
-				tc := &s.tiers[j]
-				byTier[tc.name] = tc.count
+			} else {
+				byTier = make(map[string]int, n)
+				byTier[s.tier0Name] = int(s.tier0Count)
+				if n > 1 {
+					byTier[s.tier1Name] = int(s.tier1Count)
+				}
 			}
 		}
-		out[s.pod] = PodMatch{WeightedScore: s.score, MatchedBlocks: s.matched, ConfirmedBlocks: s.confirmed, BlocksByTier: byTier}
+		out[s.pod] = PodMatch{WeightedScore: s.score, MatchedBlocks: int(s.matched), ConfirmedBlocks: int(s.confirmed), BlocksByTier: byTier}
 	}
 	return out
 }
@@ -957,54 +921,21 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			slot.weight = w
 		}
 
-		// stampTier inline in keyPodsFirst
-		stamped := false
-		if len(slot.tiers) == 0 {
-			if slot.hasTier0 {
-				if slot.tier0Ordinal == tierOrd {
-					slot.tier0Seen = a.keyStamp
-					stamped = true
-				} else {
-					// Fallback to multi-tier
-					slot.tiers = append(slot.tiers, tierChain{
-						ordinal: slot.tier0Ordinal,
-						name:    slot.tier0Name,
-						count:   slot.tier0Count,
-						seen:    slot.tier0Seen,
-						alive:   slot.tier0Alive,
-					})
-					slot.tiers = append(slot.tiers, tierChain{
-						ordinal: tierOrd,
-						name:    tier,
-						seen:    a.keyStamp,
-						alive:   true,
-					})
-					stamped = true
-				}
-			} else {
-				slot.hasTier0 = true
-				slot.tier0Ordinal = tierOrd
+		if !a.stampTier(slot, tierOrd) {
+			if slot.numTiers == 0 {
+				slot.tier0Ord = tierOrd
 				slot.tier0Name = tier
 				slot.tier0Seen = a.keyStamp
+				slot.tier0Count = 1
 				slot.tier0Alive = true
-				stamped = true
-			}
-		} else {
-			// Multi-tier path
-			for t := range slot.tiers {
-				if slot.tiers[t].ordinal == tierOrd {
-					slot.tiers[t].seen = a.keyStamp
-					stamped = true
-					break
-				}
-			}
-			if !stamped {
-				slot.tiers = append(slot.tiers, tierChain{
-					ordinal: tierOrd,
-					name:    tier,
-					seen:    a.keyStamp,
-					alive:   true,
-				})
+				slot.numTiers = 1
+			} else if slot.numTiers == 1 {
+				slot.tier1Ord = tierOrd
+				slot.tier1Name = tier
+				slot.tier1Seen = a.keyStamp
+				slot.tier1Count = 1
+				slot.tier1Alive = true
+				slot.numTiers = 2
 			}
 		}
 
@@ -1070,20 +1001,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 					slot.weight = w
 				}
 				// stampTier inline
-				if len(slot.tiers) == 0 {
-					if slot.hasTier0 && slot.tier0Ordinal == entry.tierOrd {
+				if slot.numTiers > 0 {
+					if slot.tier0Ord == entry.tierOrd {
 						slot.tier0Seen = keyStamp
-					}
-				} else {
-					if slot.tiers[0].ordinal == entry.tierOrd {
-						slot.tiers[0].seen = keyStamp
-					} else {
-						for t := 1; t < len(slot.tiers); t++ {
-							if slot.tiers[t].ordinal == entry.tierOrd {
-								slot.tiers[t].seen = keyStamp
-								break
-							}
-						}
+					} else if slot.numTiers > 1 && slot.tier1Ord == entry.tierOrd {
+						slot.tier1Seen = keyStamp
 					}
 				}
 				a.mruName = e.PodIdentifier
@@ -1194,20 +1116,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			slot.weight = w
 		}
 
-		if len(slot.tiers) == 0 {
-			if slot.hasTier0 && slot.tier0Ordinal == tierOrd {
+		if slot.numTiers > 0 {
+			if slot.tier0Ord == tierOrd {
 				slot.tier0Seen = keyStamp
-			}
-		} else {
-			if slot.tiers[0].ordinal == tierOrd {
-				slot.tiers[0].seen = keyStamp
-			} else {
-				for t := 1; t < len(slot.tiers); t++ {
-					if slot.tiers[t].ordinal == tierOrd {
-						slot.tiers[t].seen = keyStamp
-						break
-					}
-				}
+			} else if slot.numTiers > 1 && slot.tier1Ord == tierOrd {
+				slot.tier1Seen = keyStamp
 			}
 		}
 
@@ -1240,20 +1153,23 @@ func (a *prefixAccumulator) newSlot(pod string) int32 {
 		s.score = 0
 		s.seen = 0
 		s.weight = 0
-		s.tiers = s.tiers[:0]
-		s.confirmed = 0
-		s.confirmedSeen = 0
-		s.confirmedAlive = false
-		s.hasTier0 = false
-		s.tier0Ordinal = 0
+		s.numTiers = 0
+		s.tier0Ord = 0
 		s.tier0Seen = 0
 		s.tier0Count = 0
 		s.tier0Alive = false
 		s.tier0Name = ""
+		s.tier1Ord = 0
+		s.tier1Seen = 0
+		s.tier1Count = 0
+		s.tier1Alive = false
+		s.tier1Name = ""
+		s.confirmed = 0
+		s.confirmedSeen = 0
+		s.confirmedAlive = false
 	} else {
 		a.slots = append(a.slots, matchSlot{
-			pod:   pod,
-			tiers: make([]tierChain, 0, 4),
+			pod: pod,
 		})
 	}
 	return int32(n)
