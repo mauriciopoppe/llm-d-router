@@ -273,9 +273,9 @@ func (t *slotTable) insert(ordinal uint32, slot int32) {
 
 // tierChain tracks one tier's contiguous prefix for a candidate pod.
 type tierChain struct {
-	ordinal uint32
 	name    string
 	count   int
+	ordinal uint32
 	// seen is the key stamp of the last key where the pod held this tier.
 	seen  uint32
 	alive bool
@@ -289,26 +289,23 @@ type tierWeight struct {
 
 // matchSlot is one candidate pod's accumulated state.
 type matchSlot struct {
-	pod     string
-	matched int
-	score   float64
-	// seen is the key stamp of the last key holding this pod; weight is the
-	// highest tier weight among its entries at that key.
-	seen   uint32
-	weight float64
-	tiers  []tierChain
-	// confirmed tracks the chain of keys held in a non-speculative tier;
-	// confirmedSeen is the key stamp of the last key holding one.
+	score          float64
+	weight         float64
+	matched        int
 	confirmed      int
+	tier0Count     int
+	seen           uint32
 	confirmedSeen  uint32
+	tier0Seen      uint32
+	tier0Ordinal   uint32
+	isPerfect      bool
+	hasTier0       bool
 	confirmedAlive bool
+	tier0Alive     bool
 
-	hasTier0     bool
-	tier0Ordinal uint32
-	tier0Seen    uint32
-	tier0Count   int
-	tier0Alive   bool
-	tier0Name    string
+	pod       string
+	tier0Name string
+	tiers     []tierChain
 }
 
 type posCacheEntry struct {
@@ -786,11 +783,10 @@ func (a *prefixAccumulator) endKey() bool {
 	slots := a.slots
 	if a.first {
 		a.first = false
-		nSlots := len(slots)
-		if cap(a.active) < nSlots {
-			a.active = make([]int32, nSlots)
+		if cap(a.active) < len(slots) {
+			a.active = make([]int32, len(slots))
 		} else {
-			a.active = a.active[:nSlots]
+			a.active = a.active[:len(slots)]
 		}
 		for i := range slots {
 			s := &slots[i]
@@ -807,50 +803,72 @@ func (a *prefixAccumulator) endKey() bool {
 					s.tiers[t].count = 1
 				}
 			}
+			s.isPerfect = (s.confirmedSeen == keyStamp) && s.hasTier0 && (s.tier0Seen == keyStamp) && (len(s.tiers) == 0)
 			a.active[i] = int32(i)
 		}
 		return len(a.active) > 0
 	}
 
-	active := a.active
-	n := len(active)
 	idx := 0
-	for ; idx < n; idx++ {
-		i := active[idx]
+	nActive := len(a.active)
+	for ; idx < nActive; idx++ {
+		i := a.active[idx]
+		if uint32(i) >= uint32(len(slots)) {
+			break
+		}
 		s := &slots[i]
-		if s.seen != keyStamp {
+		if !s.isPerfect {
+			break
+		}
+		if (s.seen^keyStamp)|(s.confirmedSeen^keyStamp)|(s.tier0Seen^keyStamp) != 0 {
 			break
 		}
 		s.matched++
 		s.score += s.weight
-		if len(s.tiers) == 0 {
-			if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
+		s.confirmed++
+		s.tier0Count++
+	}
+
+	if idx == nActive {
+		return nActive > 0
+	}
+
+	writeIdx := idx
+	for ; idx < nActive; idx++ {
+		i := a.active[idx]
+		if uint32(i) >= uint32(len(slots)) {
+			continue
+		}
+		s := &slots[i]
+		if s.seen != keyStamp {
+			s.isPerfect = false
+			continue // the chain ends at the first key the pod does not hold
+		}
+		s.matched++
+		s.score += s.weight
+		if s.confirmedAlive {
+			if s.confirmedSeen == keyStamp {
 				s.confirmed++
-				s.tier0Count++
 			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
-				if s.tier0Alive {
-					if s.tier0Seen == keyStamp {
-						s.tier0Count++
-					} else {
-						s.tier0Alive = false
-					}
-				}
+				s.confirmedAlive = false
+				s.isPerfect = false
 			}
 		} else {
-			if s.confirmedAlive {
-				if s.confirmedSeen == keyStamp {
-					s.confirmed++
+			s.isPerfect = false
+		}
+		if len(s.tiers) == 0 {
+			if s.hasTier0 && s.tier0Alive {
+				if s.tier0Seen == keyStamp {
+					s.tier0Count++
 				} else {
-					s.confirmedAlive = false
+					s.tier0Alive = false
+					s.isPerfect = false
 				}
+			} else {
+				s.isPerfect = false
 			}
+		} else {
+			s.isPerfect = false
 			for t := range s.tiers {
 				tc := &s.tiers[t]
 				if tc.alive {
@@ -862,62 +880,10 @@ func (a *prefixAccumulator) endKey() bool {
 				}
 			}
 		}
+		a.active[writeIdx] = i
+		writeIdx++
 	}
-
-	if idx < n {
-		keepCount := idx
-		for j := idx + 1; j < n; j++ {
-			i := active[j]
-			s := &slots[i]
-			if s.seen != keyStamp {
-				continue
-			}
-			s.matched++
-			s.score += s.weight
-			if len(s.tiers) == 0 {
-				if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
-					s.confirmed++
-					s.tier0Count++
-				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
-							s.confirmed++
-						} else {
-							s.confirmedAlive = false
-						}
-					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
-						}
-					}
-				}
-			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
-				for t := range s.tiers {
-					tc := &s.tiers[t]
-					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
-						}
-					}
-				}
-			}
-			active[keepCount] = i
-			keepCount++
-		}
-		a.active = active[:keepCount]
-	}
+	a.active = a.active[:writeIdx]
 	return len(a.active) > 0
 }
 
@@ -1363,6 +1329,7 @@ func (a *prefixAccumulator) newSlot(pod string) int32 {
 		s.tier0Seen = 0
 		s.tier0Count = 0
 		s.tier0Alive = false
+		s.isPerfect = false
 		s.tier0Name = ""
 	} else {
 		a.slots = append(a.slots, matchSlot{

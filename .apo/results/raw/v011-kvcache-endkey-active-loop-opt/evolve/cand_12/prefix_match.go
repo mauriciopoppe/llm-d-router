@@ -786,12 +786,6 @@ func (a *prefixAccumulator) endKey() bool {
 	slots := a.slots
 	if a.first {
 		a.first = false
-		nSlots := len(slots)
-		if cap(a.active) < nSlots {
-			a.active = make([]int32, nSlots)
-		} else {
-			a.active = a.active[:nSlots]
-		}
 		for i := range slots {
 			s := &slots[i]
 			s.matched, s.score = 1, s.weight
@@ -807,43 +801,27 @@ func (a *prefixAccumulator) endKey() bool {
 					s.tiers[t].count = 1
 				}
 			}
-			a.active[i] = int32(i)
+			a.active = append(a.active, int32(i))
 		}
 		return len(a.active) > 0
 	}
 
-	active := a.active
-	n := len(active)
-	idx := 0
-	for ; idx < n; idx++ {
-		i := active[idx]
+	var dropped bool
+	var keptCount int
+	for _, i := range a.active {
 		s := &slots[i]
 		if s.seen != keyStamp {
-			break
+			dropped = true
+			continue
 		}
-		s.matched++
-		s.score += s.weight
-		if len(s.tiers) == 0 {
-			if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
-				s.confirmed++
-				s.tier0Count++
-			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
-				if s.tier0Alive {
-					if s.tier0Seen == keyStamp {
-						s.tier0Count++
-					} else {
-						s.tier0Alive = false
-					}
-				}
-			}
+		if len(s.tiers) == 0 && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp && s.confirmedAlive && s.tier0Alive {
+			s.matched++
+			s.score += s.weight
+			s.confirmed++
+			s.tier0Count++
 		} else {
+			s.matched++
+			s.score += s.weight
 			if s.confirmedAlive {
 				if s.confirmedSeen == keyStamp {
 					s.confirmed++
@@ -851,57 +829,15 @@ func (a *prefixAccumulator) endKey() bool {
 					s.confirmedAlive = false
 				}
 			}
-			for t := range s.tiers {
-				tc := &s.tiers[t]
-				if tc.alive {
-					if tc.seen == keyStamp {
-						tc.count++
-					} else {
-						tc.alive = false
-					}
-				}
-			}
-		}
-	}
-
-	if idx < n {
-		keepCount := idx
-		for j := idx + 1; j < n; j++ {
-			i := active[j]
-			s := &slots[i]
-			if s.seen != keyStamp {
-				continue
-			}
-			s.matched++
-			s.score += s.weight
 			if len(s.tiers) == 0 {
-				if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
-					s.confirmed++
-					s.tier0Count++
-				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
-							s.confirmed++
-						} else {
-							s.confirmedAlive = false
-						}
-					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
-						}
+				if s.hasTier0 && s.tier0Alive {
+					if s.tier0Seen == keyStamp {
+						s.tier0Count++
+					} else {
+						s.tier0Alive = false
 					}
 				}
 			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
 				for t := range s.tiers {
 					tc := &s.tiers[t]
 					if tc.alive {
@@ -913,12 +849,14 @@ func (a *prefixAccumulator) endKey() bool {
 					}
 				}
 			}
-			active[keepCount] = i
-			keepCount++
 		}
-		a.active = active[:keepCount]
+		if dropped {
+			a.active[keptCount] = i
+		}
+		keptCount++
 	}
-	return len(a.active) > 0
+	a.active = a.active[:keptCount]
+	return keptCount > 0
 }
 
 // result materializes the accumulated matches.

@@ -792,7 +792,7 @@ func (a *prefixAccumulator) endKey() bool {
 		} else {
 			a.active = a.active[:nSlots]
 		}
-		for i := range slots {
+		for i := 0; i < nSlots; i++ {
 			s := &slots[i]
 			s.matched, s.score = 1, s.weight
 			if s.confirmedSeen == keyStamp {
@@ -809,48 +809,58 @@ func (a *prefixAccumulator) endKey() bool {
 			}
 			a.active[i] = int32(i)
 		}
-		return len(a.active) > 0
+		return nSlots > 0
 	}
 
 	active := a.active
-	n := len(active)
+	nActive := len(active)
 	idx := 0
-	for ; idx < n; idx++ {
+
+	// Fast-path scan: process consecutive active slots that satisfy all fast-path conditions.
+	for idx < nActive {
 		i := active[idx]
 		s := &slots[i]
-		if s.seen != keyStamp {
+		if s.seen == keyStamp && s.confirmedAlive && s.confirmedSeen == keyStamp && len(s.tiers) == 0 && s.hasTier0 && s.tier0Alive && s.tier0Seen == keyStamp {
+			s.matched++
+			s.score += s.weight
+			s.confirmed++
+			s.tier0Count++
+			idx++
+		} else {
 			break
+		}
+	}
+
+	if idx == nActive {
+		return nActive > 0
+	}
+
+	// Slow-path scan: filter and process remaining active slots starting from idx.
+	keepCount := idx
+	for j := idx; j < nActive; j++ {
+		i := active[j]
+		s := &slots[i]
+		if s.seen != keyStamp {
+			continue // the chain ends at the first key the pod does not hold
 		}
 		s.matched++
 		s.score += s.weight
-		if len(s.tiers) == 0 {
-			if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
+		if s.confirmedAlive {
+			if s.confirmedSeen == keyStamp {
 				s.confirmed++
-				s.tier0Count++
 			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
-				if s.tier0Alive {
-					if s.tier0Seen == keyStamp {
-						s.tier0Count++
-					} else {
-						s.tier0Alive = false
-					}
+				s.confirmedAlive = false
+			}
+		}
+		if len(s.tiers) == 0 {
+			if s.hasTier0 && s.tier0Alive {
+				if s.tier0Seen == keyStamp {
+					s.tier0Count++
+				} else {
+					s.tier0Alive = false
 				}
 			}
 		} else {
-			if s.confirmedAlive {
-				if s.confirmedSeen == keyStamp {
-					s.confirmed++
-				} else {
-					s.confirmedAlive = false
-				}
-			}
 			for t := range s.tiers {
 				tc := &s.tiers[t]
 				if tc.alive {
@@ -862,63 +872,11 @@ func (a *prefixAccumulator) endKey() bool {
 				}
 			}
 		}
+		active[keepCount] = i
+		keepCount++
 	}
-
-	if idx < n {
-		keepCount := idx
-		for j := idx + 1; j < n; j++ {
-			i := active[j]
-			s := &slots[i]
-			if s.seen != keyStamp {
-				continue
-			}
-			s.matched++
-			s.score += s.weight
-			if len(s.tiers) == 0 {
-				if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
-					s.confirmed++
-					s.tier0Count++
-				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
-							s.confirmed++
-						} else {
-							s.confirmedAlive = false
-						}
-					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
-						}
-					}
-				}
-			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
-				for t := range s.tiers {
-					tc := &s.tiers[t]
-					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
-						}
-					}
-				}
-			}
-			active[keepCount] = i
-			keepCount++
-		}
-		a.active = active[:keepCount]
-	}
-	return len(a.active) > 0
+	a.active = active[:keepCount]
+	return keepCount > 0
 }
 
 // result materializes the accumulated matches.

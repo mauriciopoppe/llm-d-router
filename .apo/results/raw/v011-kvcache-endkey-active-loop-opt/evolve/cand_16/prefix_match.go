@@ -792,16 +792,14 @@ func (a *prefixAccumulator) endKey() bool {
 		} else {
 			a.active = a.active[:nSlots]
 		}
-		for i := range slots {
+		for i := 0; i < nSlots; i++ {
 			s := &slots[i]
 			s.matched, s.score = 1, s.weight
 			if s.confirmedSeen == keyStamp {
 				s.confirmed, s.confirmedAlive = 1, true
 			}
 			if len(s.tiers) == 0 {
-				if s.hasTier0 {
-					s.tier0Count = 1
-				}
+				s.tier0Count = 1
 			} else {
 				for t := range s.tiers {
 					s.tiers[t].count = 1
@@ -809,115 +807,108 @@ func (a *prefixAccumulator) endKey() bool {
 			}
 			a.active[i] = int32(i)
 		}
+		return nSlots > 0
+	}
+
+	allMatch := true
+	allTier0 := true
+	for _, i := range a.active {
+		s := &slots[i]
+		if s.seen != keyStamp {
+			allMatch = false
+			break
+		}
+		if len(s.tiers) != 0 {
+			allTier0 = false
+		}
+	}
+
+	if allMatch {
+		if allTier0 {
+			for _, i := range a.active {
+				s := &slots[i]
+				s.matched++
+				s.score += s.weight
+
+				confirmedAlive := s.confirmedAlive && s.confirmedSeen == keyStamp
+				if confirmedAlive {
+					s.confirmed++
+				}
+				s.confirmedAlive = confirmedAlive
+
+				tier0Alive := s.tier0Alive && s.tier0Seen == keyStamp
+				if tier0Alive {
+					s.tier0Count++
+				}
+				s.tier0Alive = tier0Alive
+			}
+		} else {
+			for _, i := range a.active {
+				s := &slots[i]
+				s.matched++
+				s.score += s.weight
+
+				confirmedAlive := s.confirmedAlive && s.confirmedSeen == keyStamp
+				if confirmedAlive {
+					s.confirmed++
+				}
+				s.confirmedAlive = confirmedAlive
+
+				if len(s.tiers) == 0 {
+					tier0Alive := s.tier0Alive && s.tier0Seen == keyStamp
+					if tier0Alive {
+						s.tier0Count++
+					}
+					s.tier0Alive = tier0Alive
+				} else {
+					for t := range s.tiers {
+						tc := &s.tiers[t]
+						tcAlive := tc.alive && tc.seen == keyStamp
+						if tcAlive {
+							tc.count++
+						}
+						tc.alive = tcAlive
+					}
+				}
+			}
+		}
 		return len(a.active) > 0
 	}
 
-	active := a.active
-	n := len(active)
-	idx := 0
-	for ; idx < n; idx++ {
-		i := active[idx]
+	keep := a.active[:0]
+	for _, i := range a.active {
 		s := &slots[i]
 		if s.seen != keyStamp {
-			break
+			continue
 		}
 		s.matched++
 		s.score += s.weight
+
+		confirmedAlive := s.confirmedAlive && s.confirmedSeen == keyStamp
+		if confirmedAlive {
+			s.confirmed++
+		}
+		s.confirmedAlive = confirmedAlive
+
 		if len(s.tiers) == 0 {
-			if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
-				s.confirmed++
+			tier0Alive := s.tier0Alive && s.tier0Seen == keyStamp
+			if tier0Alive {
 				s.tier0Count++
-			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
-				if s.tier0Alive {
-					if s.tier0Seen == keyStamp {
-						s.tier0Count++
-					} else {
-						s.tier0Alive = false
-					}
-				}
 			}
+			s.tier0Alive = tier0Alive
 		} else {
-			if s.confirmedAlive {
-				if s.confirmedSeen == keyStamp {
-					s.confirmed++
-				} else {
-					s.confirmedAlive = false
-				}
-			}
 			for t := range s.tiers {
 				tc := &s.tiers[t]
-				if tc.alive {
-					if tc.seen == keyStamp {
-						tc.count++
-					} else {
-						tc.alive = false
-					}
+				tcAlive := tc.alive && tc.seen == keyStamp
+				if tcAlive {
+					tc.count++
 				}
+				tc.alive = tcAlive
 			}
 		}
+		keep = append(keep, i)
 	}
-
-	if idx < n {
-		keepCount := idx
-		for j := idx + 1; j < n; j++ {
-			i := active[j]
-			s := &slots[i]
-			if s.seen != keyStamp {
-				continue
-			}
-			s.matched++
-			s.score += s.weight
-			if len(s.tiers) == 0 {
-				if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
-					s.confirmed++
-					s.tier0Count++
-				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
-							s.confirmed++
-						} else {
-							s.confirmedAlive = false
-						}
-					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
-						}
-					}
-				}
-			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
-				for t := range s.tiers {
-					tc := &s.tiers[t]
-					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
-						}
-					}
-				}
-			}
-			active[keepCount] = i
-			keepCount++
-		}
-		a.active = active[:keepCount]
-	}
+	a.active = keep
 	return len(a.active) > 0
 }
 
