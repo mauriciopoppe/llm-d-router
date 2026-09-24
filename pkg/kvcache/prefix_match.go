@@ -126,6 +126,7 @@ func maxMatchedBlocks(matches map[string]PodMatch) int {
 	return longest
 }
 
+// EVOLVE-BLOCK-START
 // matchWalk feeds the accumulator from an ordered index walk. The walk ends
 // at the first key without entries or once no chain is alive.
 func matchWalk(ctx context.Context, walker kvblock.KeyWalker, keys []kvblock.BlockHash,
@@ -165,8 +166,6 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
-	pods, tiers := ordinalTable{}, ordinalTable{}
-	var refs []kvblock.EntryRef
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -175,15 +174,20 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		if len(entries) == 0 {
 			break
 		}
-		refs = refs[:0]
-		for _, e := range entries {
-			refs = append(refs, kvblock.EntryRef{
-				PodEntry:    e,
-				PodOrdinal:  pods.of(e.PodIdentifier),
-				TierOrdinal: tiers.of(e.DeviceTier),
+		if cap(acc.refsBuf) < len(entries) {
+			acc.refsBuf = make([]kvblock.EntryRef, 0, len(entries))
+		} else {
+			acc.refsBuf = acc.refsBuf[:0]
+		}
+		for i := range entries {
+			e := &entries[i]
+			acc.refsBuf = append(acc.refsBuf, kvblock.EntryRef{
+				PodEntry:    *e,
+				PodOrdinal:  acc.podOrdinal(e.PodIdentifier),
+				TierOrdinal: acc.tierOrdinal(e.DeviceTier),
 			})
 		}
-		if !acc.key(refs) {
+		if !acc.key(acc.refsBuf) {
 			break
 		}
 	}
@@ -195,17 +199,6 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	return acc.result(), nil
 }
 
-// ordinalTable assigns dense ordinals to names in first-seen order.
-type ordinalTable map[string]uint32
-
-func (t ordinalTable) of(name string) uint32 {
-	if id, ok := t[name]; ok {
-		return id
-	}
-	id := uint32(len(t))
-	t[name] = id
-	return id
-}
 
 // speculativeTierOrdinal keys the speculative per-tier chain. Feeders assign
 // tier ordinals from zero, so the top of the range never collides.
@@ -317,23 +310,56 @@ type prefixAccumulator struct {
 	// weightCache holds the weight of every tier seen in this accumulation,
 	// scanned linearly: requests see a handful of tiers.
 	weightCache []tierWeight
+
+	podsMap  map[string]uint32
+	tiersMap map[string]uint32
+	refsBuf  []kvblock.EntryRef
 }
 
-var accumulatorPool = sync.Pool{New: func() any { return &prefixAccumulator{} }}
+var accumulatorPool = sync.Pool{New: func() any {
+	slots := make([]matchSlot, 256)
+	for i := range slots {
+		slots[i].tiers = make([]tierChain, 0, 4)
+	}
+	return &prefixAccumulator{
+		table:       slotTable{buckets: make([]slotRef, 512)},
+		slots:       slots[:0],
+		active:      make([]int32, 0, 256),
+		weightCache: make([]tierWeight, 0, 8),
+		podsMap:     make(map[string]uint32, 128),
+		tiersMap:    make(map[string]uint32, 16),
+		refsBuf:     make([]kvblock.EntryRef, 0, 512),
+	}
+}}
 
 func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *prefixAccumulator {
-	a, _ := accumulatorPool.Get().(*prefixAccumulator)
+	a := accumulatorPool.Get().(*prefixAccumulator)
 	a.weights, a.filter = weights, filter
 	a.slots = a.slots[:0]
 	a.active = a.active[:0]
 	a.keyStamp = 0
 	a.first = true
 	a.weightCache = a.weightCache[:0]
+	if a.podsMap == nil {
+		a.podsMap = make(map[string]uint32, 128)
+	} else {
+		clear(a.podsMap)
+	}
+	if a.tiersMap == nil {
+		a.tiersMap = make(map[string]uint32, 16)
+	} else {
+		clear(a.tiersMap)
+	}
+	clear(a.refsBuf)
+	a.refsBuf = a.refsBuf[:0]
 	return a
 }
 
 func releaseAccumulator(a *prefixAccumulator) {
 	a.weights, a.filter = nil, nil
+	for i := 0; i < len(a.slots); i++ {
+		a.slots[i].pod = ""
+	}
 	accumulatorPool.Put(a)
 }
 
@@ -456,9 +482,12 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 	out := make(map[string]PodMatch, len(a.slots))
 	for i := range a.slots {
 		s := &a.slots[i]
-		byTier := make(map[string]int, len(s.tiers))
-		for _, tc := range s.tiers {
-			byTier[tc.name] = tc.count
+		var byTier map[string]int
+		if len(s.tiers) > 0 {
+			byTier = make(map[string]int, len(s.tiers))
+			for _, tc := range s.tiers {
+				byTier[tc.name] = tc.count
+			}
 		}
 		out[s.pod] = PodMatch{WeightedScore: s.score, MatchedBlocks: s.matched, ConfirmedBlocks: s.confirmed, BlocksByTier: byTier}
 	}
@@ -472,11 +501,40 @@ func (a *prefixAccumulator) newSlot(pod string) int32 {
 	if n < cap(a.slots) {
 		a.slots = a.slots[:n+1]
 		s := &a.slots[n]
-		*s = matchSlot{pod: pod, tiers: s.tiers[:0]}
+		s.pod = pod
+		s.matched = 0
+		s.score = 0
+		s.seen = 0
+		s.weight = 0
+		s.tiers = s.tiers[:0]
+		s.confirmed = 0
+		s.confirmedSeen = 0
+		s.confirmedAlive = false
 	} else {
-		a.slots = append(a.slots, matchSlot{pod: pod})
+		a.slots = append(a.slots, matchSlot{
+			pod:   pod,
+			tiers: make([]tierChain, 0, 4),
+		})
 	}
 	return int32(n)
+}
+
+func (a *prefixAccumulator) podOrdinal(name string) uint32 {
+	if id, ok := a.podsMap[name]; ok {
+		return id
+	}
+	id := uint32(len(a.podsMap))
+	a.podsMap[name] = id
+	return id
+}
+
+func (a *prefixAccumulator) tierOrdinal(name string) uint32 {
+	if id, ok := a.tiersMap[name]; ok {
+		return id
+	}
+	id := uint32(len(a.tiersMap))
+	a.tiersMap[name] = id
+	return id
 }
 
 // weightOf resolves a tier's weight, caching by ordinal so the configured
@@ -497,3 +555,5 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 	a.weightCache = append(a.weightCache, tierWeight{ordinal: ordinal, weight: w})
 	return w
 }
+// EVOLVE-BLOCK-END
+
