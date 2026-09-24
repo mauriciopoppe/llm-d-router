@@ -313,7 +313,6 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {
@@ -656,7 +655,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				}
 				// stampTier inline
 				if len(slot.tiers) == 0 {
-					if slot.tier0Ordinal == entry.tierOrd {
+					if slot.hasTier0 && slot.tier0Ordinal == entry.tierOrd {
 						slot.tier0Seen = keyStamp
 					}
 				} else {
@@ -675,6 +674,8 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			}
 		}
 
+		// Another rank of an endpoint just folded at this key adds nothing
+		// to its chains.
 		if i > 0 {
 			prev := &entries[i-1]
 			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
@@ -749,7 +750,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 
 		// stampTier inline
 		if len(slot.tiers) == 0 {
-			if slot.tier0Ordinal == tierOrdinal {
+			if slot.hasTier0 && slot.tier0Ordinal == tierOrdinal {
 				slot.tier0Seen = keyStamp
 			}
 		} else {
@@ -828,39 +829,24 @@ func (a *prefixAccumulator) endKey() bool {
 		s.matched++
 		s.score += s.weight
 		if len(s.tiers) == 0 {
-			if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
+			s.confirmedAlive = s.confirmedAlive && s.confirmedSeen == keyStamp
+			if s.confirmedAlive {
 				s.confirmed++
+			}
+			s.tier0Alive = s.tier0Alive && s.tier0Seen == keyStamp
+			if s.tier0Alive {
 				s.tier0Count++
-			} else {
-				if s.confirmedAlive {
-					if s.confirmedSeen == keyStamp {
-						s.confirmed++
-					} else {
-						s.confirmedAlive = false
-					}
-				}
-				if s.tier0Alive {
-					if s.tier0Seen == keyStamp {
-						s.tier0Count++
-					} else {
-						s.tier0Alive = false
-					}
-				}
 			}
 		} else {
-			if s.confirmedAlive && s.confirmedSeen == keyStamp {
+			s.confirmedAlive = s.confirmedAlive && s.confirmedSeen == keyStamp
+			if s.confirmedAlive {
 				s.confirmed++
-			} else {
-				s.confirmedAlive = false
 			}
 			for t := range s.tiers {
 				tc := &s.tiers[t]
+				tc.alive = tc.alive && tc.seen == keyStamp
 				if tc.alive {
-					if tc.seen == keyStamp {
-						tc.count++
-					} else {
-						tc.alive = false
-					}
+					tc.count++
 				}
 			}
 		}
@@ -877,39 +863,24 @@ func (a *prefixAccumulator) endKey() bool {
 			s.matched++
 			s.score += s.weight
 			if len(s.tiers) == 0 {
-				if s.confirmedAlive && s.tier0Alive && s.confirmedSeen == keyStamp && s.tier0Seen == keyStamp {
+				s.confirmedAlive = s.confirmedAlive && s.confirmedSeen == keyStamp
+				if s.confirmedAlive {
 					s.confirmed++
+				}
+				s.tier0Alive = s.tier0Alive && s.tier0Seen == keyStamp
+				if s.tier0Alive {
 					s.tier0Count++
-				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
-							s.confirmed++
-						} else {
-							s.confirmedAlive = false
-						}
-					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
-						}
-					}
 				}
 			} else {
-				if s.confirmedAlive && s.confirmedSeen == keyStamp {
+				s.confirmedAlive = s.confirmedAlive && s.confirmedSeen == keyStamp
+				if s.confirmedAlive {
 					s.confirmed++
-				} else {
-					s.confirmedAlive = false
 				}
 				for t := range s.tiers {
 					tc := &s.tiers[t]
+					tc.alive = tc.alive && tc.seen == keyStamp
 					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
-						}
+						tc.count++
 					}
 				}
 			}
@@ -1183,7 +1154,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				}
 				// stampTier inline
 				if len(slot.tiers) == 0 {
-					if slot.tier0Ordinal == entry.tierOrd {
+					if slot.hasTier0 && slot.tier0Ordinal == entry.tierOrd {
 						slot.tier0Seen = keyStamp
 					}
 				} else {
@@ -1313,7 +1284,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		}
 
 		if len(slot.tiers) == 0 {
-			if slot.tier0Ordinal == tierOrd {
+			if slot.hasTier0 && slot.tier0Ordinal == tierOrd {
 				slot.tier0Seen = keyStamp
 			}
 		} else {
