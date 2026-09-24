@@ -355,7 +355,7 @@ type prefixAccumulator struct {
 	speculativeWeight    float64
 	speculativeWeightSet bool
 
-	posCache256 [256]posCacheEntry
+	posCache512 [512]posCacheEntry
 	podCache    [1024]podCacheEntry
 	tierCache   [4]tierCacheEntry
 
@@ -417,7 +417,7 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	a.mruName = ""
 	a.lastTierName = ""
 	clear(a.podCache[:])
-	clear(a.posCache256[:])
+	clear(a.posCache512[:])
 	clear(a.tierCache[:])
 	if a.singularCache == nil {
 		a.singularCache = make(map[string][]map[string]int, 8)
@@ -705,13 +705,22 @@ func (a *prefixAccumulator) endKey() bool {
 // result materializes the accumulated matches.
 func (a *prefixAccumulator) result() map[string]PodMatch {
 	out := make(map[string]PodMatch, len(a.slots))
+	var lastTierName string
+	var lastSlice []map[string]int
 	for i := range a.slots {
 		s := &a.slots[i]
 		var byTier map[string]int
 		if n := len(s.tiers); n > 0 {
 			if n == 1 {
 				tc := &s.tiers[0]
-				slice := a.singularCache[tc.name]
+				var slice []map[string]int
+				if tc.name == lastTierName {
+					slice = lastSlice
+				} else {
+					slice = a.singularCache[tc.name]
+					lastTierName = tc.name
+					lastSlice = slice
+				}
 				if tc.count < len(slice) && slice[tc.count] != nil {
 					byTier = slice[tc.count]
 				} else {
@@ -720,6 +729,7 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 						copy(newSlice, slice)
 						slice = newSlice
 						a.singularCache[tc.name] = slice
+						lastSlice = slice
 					}
 					m := map[string]int{tc.name: tc.count}
 					slice[tc.count] = m
@@ -749,14 +759,13 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 	var lastSlot int32
 	var lastOk bool
 
+	var prev *kvblock.PodEntry
 	for i := range entries {
 		e := &entries[i]
-		if i > 0 {
-			prev := &entries[i-1]
-			if prev.PodIdentifier == e.PodIdentifier && prev.DeviceTier == e.DeviceTier && prev.Speculative == e.Speculative {
-				continue
-			}
+		if prev != nil && prev.PodIdentifier == e.PodIdentifier && prev.DeviceTier == e.DeviceTier && prev.Speculative == e.Speculative {
+			continue
 		}
+		prev = e
 
 		// Resolve pod ordinal
 		var podOrd uint32
@@ -849,8 +858,8 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
+		if i < 512 {
+			a.posCache512[i] = posCacheEntry{
 				podName:     e.PodIdentifier,
 				tierName:    e.DeviceTier,
 				speculative: e.Speculative,
@@ -909,14 +918,13 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	var lastSlot int32
 	var lastOk bool
 
+	var prev *kvblock.PodEntry
 	for i := range entries {
 		e := &entries[i]
-		if i > 0 {
-			prev := &entries[i-1]
-			if prev.PodIdentifier == e.PodIdentifier && prev.DeviceTier == e.DeviceTier && prev.Speculative == e.Speculative {
-				continue
-			}
+		if prev != nil && prev.PodIdentifier == e.PodIdentifier && prev.DeviceTier == e.DeviceTier && prev.Speculative == e.Speculative {
+			continue
 		}
+		prev = e
 
 		var s int32
 		var podOrd uint32
@@ -924,12 +932,12 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		var tier string
 		var ok bool
 
-		if i < 256 && a.posCache256[i].podName == e.PodIdentifier &&
-			a.posCache256[i].tierName == e.DeviceTier &&
-			a.posCache256[i].speculative == e.Speculative {
-			s = a.posCache256[i].slot
-			podOrd = a.posCache256[i].podOrd
-			tierOrd = a.posCache256[i].tierOrd
+		if i < 512 && a.posCache512[i].podName == e.PodIdentifier &&
+			a.posCache512[i].tierName == e.DeviceTier &&
+			a.posCache512[i].speculative == e.Speculative {
+			s = a.posCache512[i].slot
+			podOrd = a.posCache512[i].podOrd
+			tierOrd = a.posCache512[i].tierOrd
 			if e.Speculative || e.DeviceTier == SpeculativeTier {
 				tier = SpeculativeTier
 			} else {
@@ -1019,8 +1027,8 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				}
 			}
 
-			if i < 256 {
-				a.posCache256[i] = posCacheEntry{
+			if i < 512 {
+				a.posCache512[i] = posCacheEntry{
 					podName:     e.PodIdentifier,
 					tierName:    e.DeviceTier,
 					speculative: e.Speculative,

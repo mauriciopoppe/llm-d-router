@@ -705,13 +705,22 @@ func (a *prefixAccumulator) endKey() bool {
 // result materializes the accumulated matches.
 func (a *prefixAccumulator) result() map[string]PodMatch {
 	out := make(map[string]PodMatch, len(a.slots))
+	var lastTier string
+	var lastSlice []map[string]int
 	for i := range a.slots {
 		s := &a.slots[i]
 		var byTier map[string]int
 		if n := len(s.tiers); n > 0 {
 			if n == 1 {
 				tc := &s.tiers[0]
-				slice := a.singularCache[tc.name]
+				var slice []map[string]int
+				if tc.name == lastTier {
+					slice = lastSlice
+				} else {
+					slice = a.singularCache[tc.name]
+					lastTier = tc.name
+					lastSlice = slice
+				}
 				if tc.count < len(slice) && slice[tc.count] != nil {
 					byTier = slice[tc.count]
 				} else {
@@ -720,6 +729,7 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 						copy(newSlice, slice)
 						slice = newSlice
 						a.singularCache[tc.name] = slice
+						lastSlice = slice
 					}
 					m := map[string]int{tc.name: tc.count}
 					slice[tc.count] = m
@@ -758,7 +768,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		// Resolve pod ordinal
+		// Resolve pod ordinal and look up/insert slot
 		var podOrd uint32
 		var s int32
 		var ok bool
@@ -788,6 +798,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			a.mruOrd = podOrd
 			a.hasMru = true
 
+			// Look up/insert in slot table
 			s, ok = a.table.lookup(podOrd)
 			if !ok {
 				if a.hasFilter && !a.filter.Has(e.PodIdentifier) {
@@ -905,7 +916,8 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
-	var lastPodOrd uint32 = ^uint32(0)
+	var lastPodIdentifier string
+	var lastPodOrd uint32
 	var lastSlot int32
 	var lastOk bool
 
@@ -939,9 +951,19 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			a.mruName = e.PodIdentifier
 			a.mruOrd = podOrd
 			a.hasMru = true
+
+			lastPodIdentifier = e.PodIdentifier
+			lastPodOrd = podOrd
+			lastSlot = s
+			lastOk = true
 		} else {
 			var found bool
-			if a.hasMru && a.mruName == e.PodIdentifier {
+			if e.PodIdentifier == lastPodIdentifier {
+				podOrd = lastPodOrd
+				s = lastSlot
+				ok = lastOk
+				found = true
+			} else if a.hasMru && a.mruName == e.PodIdentifier {
 				podOrd = a.mruOrd
 				found = true
 			} else {
@@ -969,10 +991,9 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				continue
 			}
 
-			if podOrd == lastPodOrd {
-				s, ok = lastSlot, lastOk
-			} else {
+			if e.PodIdentifier != lastPodIdentifier {
 				s, ok = a.table.lookup(podOrd)
+				lastPodIdentifier = e.PodIdentifier
 				lastPodOrd = podOrd
 				lastSlot = s
 				lastOk = ok

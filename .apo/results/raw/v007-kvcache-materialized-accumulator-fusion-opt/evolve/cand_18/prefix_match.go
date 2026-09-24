@@ -366,7 +366,7 @@ type prefixAccumulator struct {
 	lastTierOrd  uint32
 	hasLastTier  bool
 
-	singularCache   map[string][]map[string]int
+	singularCache [][]map[string]int
 }
 
 var accumulatorPool = sync.Pool{New: func() any {
@@ -383,7 +383,7 @@ var accumulatorPool = sync.Pool{New: func() any {
 		tiersMap:      make(map[string]uint32, 16),
 		refsBuf:       make([]kvblock.EntryRef, 0, 512),
 		posCache:      make([]uint64, 0, 512),
-		singularCache: make(map[string][]map[string]int, 8),
+		singularCache: make([][]map[string]int, 16),
 	}
 }}
 
@@ -403,8 +403,6 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	}
 	if a.tiersMap == nil {
 		a.tiersMap = make(map[string]uint32, 16)
-	} else {
-		clear(a.tiersMap)
 	}
 	clear(a.refsBuf)
 	a.refsBuf = a.refsBuf[:0]
@@ -420,7 +418,7 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	clear(a.posCache256[:])
 	clear(a.tierCache[:])
 	if a.singularCache == nil {
-		a.singularCache = make(map[string][]map[string]int, 8)
+		a.singularCache = make([][]map[string]int, 16)
 	}
 	return a
 }
@@ -448,6 +446,10 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	weightCacheDirect := &a.weightCacheDirect
 	weightCacheSet := a.weightCacheSet
 
+	var lastPodOrd uint32 = ^uint32(0)
+	var lastSlot int32
+	var lastOk bool
+
 	var prev *kvblock.EntryRef
 	for i := range entries {
 		ref := &entries[i]
@@ -457,13 +459,31 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 		}
 		prev = ref
 
-		s, ok := a.table.lookup(ref.PodOrdinal)
-		if !ok {
-			if a.hasFilter && !a.filter.Has(ref.PodIdentifier) {
-				continue
+		var s int32
+		var ok bool
+		if ref.PodOrdinal == lastPodOrd {
+			s = lastSlot
+			ok = lastOk
+		} else {
+			s, ok = a.table.lookup(ref.PodOrdinal)
+			if !ok {
+				if a.hasFilter && !a.filter.Has(ref.PodIdentifier) {
+					ok = false
+				} else {
+					s = a.newSlot(ref.PodIdentifier)
+					a.table.insert(ref.PodOrdinal, s)
+					ok = true
+				}
+			} else {
+				ok = true
 			}
-			s = a.newSlot(ref.PodIdentifier)
-			a.table.insert(ref.PodOrdinal, s)
+			lastPodOrd = ref.PodOrdinal
+			lastSlot = s
+			lastOk = ok
+		}
+
+		if !ok {
+			continue
 		}
 
 		if i < len(a.posCache) {
@@ -523,6 +543,10 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
+	var lastPodOrd uint32 = ^uint32(0)
+	var lastSlot int32
+	var lastOk bool
+
 	var prev *kvblock.EntryRef
 	for i := range entries {
 		ref := &entries[i]
@@ -536,26 +560,34 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 
 		var s int32
 		var ok bool
-		if i < len(posCache) {
-			val := posCache[i]
-			if uint32(val>>32) == ref.PodOrdinal {
-				s = int32(val)
-				ok = true
+		if ref.PodOrdinal == lastPodOrd {
+			s = lastSlot
+			ok = lastOk
+		} else {
+			if i < len(posCache) {
+				val := posCache[i]
+				if uint32(val>>32) == ref.PodOrdinal {
+					s = int32(val)
+					ok = true
+				}
 			}
-		}
-		if !ok {
-			if uint32(mru>>32) == ref.PodOrdinal {
-				s = int32(mru)
-				ok = true
-			} else {
-				s, ok = a.table.lookup(ref.PodOrdinal)
-				if ok {
-					mru = (uint64(ref.PodOrdinal) << 32) | uint64(uint32(s))
-					if i < len(posCache) {
-						posCache[i] = mru
+			if !ok {
+				if uint32(mru>>32) == ref.PodOrdinal {
+					s = int32(mru)
+					ok = true
+				} else {
+					s, ok = a.table.lookup(ref.PodOrdinal)
+					if ok {
+						mru = (uint64(ref.PodOrdinal) << 32) | uint64(uint32(s))
+						if i < len(posCache) {
+							posCache[i] = mru
+						}
 					}
 				}
 			}
+			lastPodOrd = ref.PodOrdinal
+			lastSlot = s
+			lastOk = ok
 		}
 
 		if !ok {
@@ -711,7 +743,20 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 		if n := len(s.tiers); n > 0 {
 			if n == 1 {
 				tc := &s.tiers[0]
-				slice := a.singularCache[tc.name]
+				var tierIdx int
+				if tc.ordinal == speculativeTierOrdinal {
+					tierIdx = 0
+				} else {
+					tierIdx = int(tc.ordinal) + 1
+				}
+
+				if tierIdx >= len(a.singularCache) {
+					newCache := make([][]map[string]int, tierIdx+8)
+					copy(newCache, a.singularCache)
+					a.singularCache = newCache
+				}
+
+				slice := a.singularCache[tierIdx]
 				if tc.count < len(slice) && slice[tc.count] != nil {
 					byTier = slice[tc.count]
 				} else {
@@ -719,7 +764,7 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 						newSlice := make([]map[string]int, tc.count+64)
 						copy(newSlice, slice)
 						slice = newSlice
-						a.singularCache[tc.name] = slice
+						a.singularCache[tierIdx] = slice
 					}
 					m := map[string]int{tc.name: tc.count}
 					slice[tc.count] = m
@@ -747,7 +792,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 	var lastPodIdentifier string
 	var lastPodOrd uint32
 	var lastSlot int32
-	var lastOk bool
+	var lastSlotOk bool
 
 	for i := range entries {
 		e := &entries[i]
@@ -758,7 +803,6 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		// Resolve pod ordinal
 		var podOrd uint32
 		var s int32
 		var ok bool
@@ -766,8 +810,9 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		if e.PodIdentifier == lastPodIdentifier {
 			podOrd = lastPodOrd
 			s = lastSlot
-			ok = lastOk
+			ok = lastSlotOk
 		} else {
+			// Resolve pod ordinal
 			h := fastHash(e.PodIdentifier)
 			idx := h & 1023
 			for {
@@ -784,10 +829,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 				idx = (idx + 1) & 1023
 			}
 
-			a.mruName = e.PodIdentifier
-			a.mruOrd = podOrd
-			a.hasMru = true
-
+			// Look up/insert in slot table
 			s, ok = a.table.lookup(podOrd)
 			if !ok {
 				if a.hasFilter && !a.filter.Has(e.PodIdentifier) {
@@ -797,16 +839,22 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 					a.table.insert(podOrd, s)
 					ok = true
 				}
+			} else {
+				ok = true
 			}
 			lastPodIdentifier = e.PodIdentifier
 			lastPodOrd = podOrd
 			lastSlot = s
-			lastOk = ok
+			lastSlotOk = ok
 		}
 
 		if !ok {
 			continue
 		}
+
+		a.mruName = e.PodIdentifier
+		a.mruOrd = podOrd
+		a.hasMru = true
 
 		// Resolve tier ordinal and tier name
 		var tierOrd uint32
@@ -905,7 +953,8 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
-	var lastPodOrd uint32 = ^uint32(0)
+	var lastPodIdentifier string
+	var lastPodOrd uint32
 	var lastSlot int32
 	var lastOk bool
 
@@ -939,6 +988,64 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			a.mruName = e.PodIdentifier
 			a.mruOrd = podOrd
 			a.hasMru = true
+
+			lastPodIdentifier = e.PodIdentifier
+			lastPodOrd = podOrd
+			lastSlot = s
+			lastOk = true
+		} else if e.PodIdentifier == lastPodIdentifier {
+			podOrd = lastPodOrd
+			s = lastSlot
+			ok = lastOk
+			if ok {
+				if e.Speculative || e.DeviceTier == SpeculativeTier {
+					tier = SpeculativeTier
+					tierOrd = speculativeTierOrdinal
+				} else {
+					tier = e.DeviceTier
+					if a.hasLastTier && a.lastTierName == e.DeviceTier {
+						tierOrd = a.lastTierOrd
+					} else {
+						if a.tierCache[0].name == e.DeviceTier {
+							tierOrd = a.tierCache[0].ord
+						} else if a.tierCache[1].name == e.DeviceTier {
+							tierOrd = a.tierCache[1].ord
+						} else if a.tierCache[2].name == e.DeviceTier {
+							tierOrd = a.tierCache[2].ord
+						} else if a.tierCache[3].name == e.DeviceTier {
+							tierOrd = a.tierCache[3].ord
+						} else {
+							tierOrd = a.tierOrdinal(e.DeviceTier)
+							if a.tierCache[0].name == "" {
+								a.tierCache[0].name = e.DeviceTier
+								a.tierCache[0].ord = tierOrd
+							} else if a.tierCache[1].name == "" {
+								a.tierCache[1].name = e.DeviceTier
+								a.tierCache[1].ord = tierOrd
+							} else if a.tierCache[2].name == "" {
+								a.tierCache[2].name = e.DeviceTier
+								a.tierCache[2].ord = tierOrd
+							} else if a.tierCache[3].name == "" {
+								a.tierCache[3].name = e.DeviceTier
+								a.tierCache[3].ord = tierOrd
+							}
+						}
+						a.lastTierName = e.DeviceTier
+						a.lastTierOrd = tierOrd
+						a.hasLastTier = true
+					}
+				}
+				if i < 256 {
+					a.posCache256[i] = posCacheEntry{
+						podName:     e.PodIdentifier,
+						tierName:    e.DeviceTier,
+						speculative: e.Speculative,
+						podOrd:      podOrd,
+						tierOrd:     tierOrd,
+						slot:        s,
+					}
+				}
+			}
 		} else {
 			var found bool
 			if a.hasMru && a.mruName == e.PodIdentifier {
@@ -966,18 +1073,19 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 
 			if !found {
+				lastPodIdentifier = e.PodIdentifier
+				lastPodOrd = 0
+				lastSlot = 0
+				lastOk = false
 				continue
 			}
 
-			if podOrd == lastPodOrd {
-				s, ok = lastSlot, lastOk
-			} else {
-				s, ok = a.table.lookup(podOrd)
-				lastPodOrd = podOrd
-				lastSlot = s
-				lastOk = ok
-			}
+			s, ok = a.table.lookup(podOrd)
 			if !ok {
+				lastPodIdentifier = e.PodIdentifier
+				lastPodOrd = podOrd
+				lastSlot = 0
+				lastOk = false
 				continue
 			}
 
@@ -1029,6 +1137,14 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 					slot:        s,
 				}
 			}
+			lastPodIdentifier = e.PodIdentifier
+			lastPodOrd = podOrd
+			lastSlot = s
+			lastOk = true
+		}
+
+		if !ok {
+			continue
 		}
 
 		slot := &slots[s]

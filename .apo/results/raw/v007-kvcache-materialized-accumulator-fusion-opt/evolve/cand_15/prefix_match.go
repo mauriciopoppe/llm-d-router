@@ -758,7 +758,6 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		// Resolve pod ordinal
 		var podOrd uint32
 		var s int32
 		var ok bool
@@ -808,7 +807,6 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			continue
 		}
 
-		// Resolve tier ordinal and tier name
 		var tierOrd uint32
 		var tier string
 		if e.Speculative || e.DeviceTier == SpeculativeTier {
