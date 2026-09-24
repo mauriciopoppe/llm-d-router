@@ -296,19 +296,19 @@ type tierWeight struct {
 // matchSlot is one candidate pod's accumulated state.
 type matchSlot struct {
 	// --- Hot loop state (fits entirely within a single 64-byte cache line) ---
-	score          float64 // 8 bytes
-	weight         float64 // 8 bytes
-	matched        int     // 8 bytes
-	confirmed      int     // 8 bytes
-	tier0Count     int     // 8 bytes
-	confirmedSeen  uint32  // 4 bytes
-	tier0Seen      uint32  // 4 bytes
-	seen           uint32  // 4 bytes
-	tier0Ordinal   uint32  // 4 bytes
-	confirmedAlive bool    // 1 byte
-	tier0Alive     bool    // 1 byte
-	hasTier0       bool    // 1 byte
-	isMultiTier    bool    // 1 byte
+	score          float64 // 8 bytes (offset 0)
+	weight         float64 // 8 bytes (offset 8)
+	matched        int     // 8 bytes (offset 16)
+	confirmed      int     // 8 bytes (offset 24)
+	tier0Count     int     // 8 bytes (offset 32)
+	confirmedSeen  uint32  // 4 bytes (offset 40)
+	tier0Seen      uint32  // 4 bytes (offset 44)
+	seen           uint32  // 4 bytes (offset 48)
+	tier0Ordinal   uint32  // 4 bytes (offset 52)
+	confirmedAlive bool    // 1 byte  (offset 56)
+	tier0Alive     bool    // 1 byte  (offset 57)
+	hasTier0       bool    // 1 byte  (offset 58)
+	isMultiTier    bool    // 1 byte  (offset 59)
 
 	// --- Cold fields (moved to secondary cache line) ---
 	pod       string
@@ -795,7 +795,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 func (a *prefixAccumulator) endKey() bool {
 	keyStamp := a.keyStamp
 	slots := a.slots
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	if a.first {
 		a.first = false
 		nSlots := len(slots)
@@ -824,15 +823,16 @@ func (a *prefixAccumulator) endKey() bool {
 		return len(a.active) > 0
 	}
 
+	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	active := a.active
 	n := len(active)
-	idx := 0
 
-	if len(active) == len(slots) {
-		for ; idx < n; idx++ {
+	if n == len(slots) {
+		keepCount := 0
+		for idx := range slots {
 			s := &slots[idx]
 			if s.seen != keyStamp {
-				break
+				continue
 			}
 			s.matched++
 			s.score += s.weight
@@ -873,50 +873,55 @@ func (a *prefixAccumulator) endKey() bool {
 					}
 				}
 			}
+			active[keepCount] = int32(idx)
+			keepCount++
 		}
-	} else {
-		for ; idx < n; idx++ {
-			i := active[idx]
-			s := &slots[i]
-			if s.seen != keyStamp {
-				break
-			}
-			s.matched++
-			s.score += s.weight
-			if !s.isMultiTier {
-				if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
-					s.confirmed++
-					s.tier0Count++
-				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
-							s.confirmed++
-						} else {
-							s.confirmedAlive = false
-						}
-					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
-						}
-					}
-				}
+		a.active = active[:keepCount]
+		return len(a.active) > 0
+	}
+
+	idx := 0
+	for ; idx < n; idx++ {
+		i := active[idx]
+		s := &slots[i]
+		if s.seen != keyStamp {
+			break
+		}
+		s.matched++
+		s.score += s.weight
+		if !s.isMultiTier {
+			if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+				s.confirmed++
+				s.tier0Count++
 			} else {
-				if s.confirmedAlive && s.confirmedSeen == keyStamp {
-					s.confirmed++
-				} else {
-					s.confirmedAlive = false
+				if s.confirmedAlive {
+					if s.confirmedSeen == keyStamp {
+						s.confirmed++
+					} else {
+						s.confirmedAlive = false
+					}
 				}
-				for t := range s.tiers {
-					tc := &s.tiers[t]
-					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
-						}
+				if s.tier0Alive {
+					if s.tier0Seen == keyStamp {
+						s.tier0Count++
+					} else {
+						s.tier0Alive = false
+					}
+				}
+			}
+		} else {
+			if s.confirmedAlive && s.confirmedSeen == keyStamp {
+				s.confirmed++
+			} else {
+				s.confirmedAlive = false
+			}
+			for t := range s.tiers {
+				tc := &s.tiers[t]
+				if tc.alive {
+					if tc.seen == keyStamp {
+						tc.count++
+					} else {
+						tc.alive = false
 					}
 				}
 			}

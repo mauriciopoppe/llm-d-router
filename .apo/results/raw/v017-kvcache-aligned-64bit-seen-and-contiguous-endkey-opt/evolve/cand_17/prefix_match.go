@@ -314,27 +314,27 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [7]byte // Padding to align to exactly 128 bytes
+	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {
 	podName       string
 	tierName      string
-	speculative   bool
+	weight        float64
 	podOrd        uint32
 	tierOrd       uint32
 	slot          int32
-	weight        float64
+	speculative   bool
 	confirmed     bool
 	isSingleTier0 bool
 }
 
 type posCacheEntryKey struct {
+	weight         float64
 	podAndRawTier  uint64
 	slot           int32
-	weight         float64
-	confirmed      bool
 	tierOrd        uint32
+	confirmed      bool
 	refSpeculative bool
 	isSingleTier0  bool
 }
@@ -379,6 +379,7 @@ type prefixAccumulator struct {
 	refsBuf  []kvblock.EntryRef
 
 	posCache             []posCacheEntryKey
+	posCachePods         []posCacheEntry
 	mru                  uint64
 	weightCacheDirect    [64]float64
 	weightCacheSet       uint64
@@ -387,7 +388,6 @@ type prefixAccumulator struct {
 	speculativeWeight    float64
 	speculativeWeightSet bool
 
-	posCache256 [256]posCacheEntry
 	podCache    [2048]podCacheEntry
 	tierCache   [4]tierCacheEntry
 
@@ -418,6 +418,7 @@ var accumulatorPool = sync.Pool{New: func() any {
 		tiersMap:      make(map[string]uint32, 16),
 		refsBuf:       make([]kvblock.EntryRef, 0, 512),
 		posCache:      make([]posCacheEntryKey, 0, 512),
+		posCachePods:  make([]posCacheEntry, 0, 512),
 		singularCache: make(map[string][]map[string]int, 8),
 	}
 }}
@@ -454,7 +455,6 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	a.mruName = ""
 	a.lastTierName = ""
 	clear(a.podCache[:])
-	clear(a.posCache256[:])
 	clear(a.tierCache[:])
 	if a.singularCache == nil {
 		a.singularCache = make(map[string][]map[string]int, 8)
@@ -647,13 +647,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				if slot.seen < keyStamp-1 {
 					continue
 				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
-				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
 				} else {
@@ -677,6 +670,13 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 							}
 						}
 					}
+				}
+				w := entry.weight
+				if slot.seen != keyStamp {
+					slot.seen = keyStamp
+					slot.weight = w
+				} else if w > slot.weight {
+					slot.weight = w
 				}
 				continue
 			}
@@ -795,7 +795,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 func (a *prefixAccumulator) endKey() bool {
 	keyStamp := a.keyStamp
 	slots := a.slots
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	if a.first {
 		a.first = false
 		nSlots := len(slots)
@@ -824,11 +823,12 @@ func (a *prefixAccumulator) endKey() bool {
 		return len(a.active) > 0
 	}
 
+	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	active := a.active
 	n := len(active)
 	idx := 0
 
-	if len(active) == len(slots) {
+	if n == len(slots) {
 		for ; idx < n; idx++ {
 			s := &slots[idx]
 			if s.seen != keyStamp {
@@ -986,7 +986,8 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 		var byTier map[string]int
 		if !s.isMultiTier {
 			if s.hasTier0 {
-				if (stringIdentical(s.tier0Name, a.lastSingularName) || s.tier0Name == a.lastSingularName) && s.tier0Count == a.lastSingularCount {
+				podIdentical := *(*uintptr)(unsafe.Pointer(&s.tier0Name)) == *(*uintptr)(unsafe.Pointer(&a.lastSingularName)) && len(s.tier0Name) == len(a.lastSingularName)
+				if (podIdentical || s.tier0Name == a.lastSingularName) && s.tier0Count == a.lastSingularCount {
 					byTier = a.lastSingularMap
 				} else {
 					slice := a.singularCache[s.tier0Name]
@@ -1024,6 +1025,12 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 	a.table.reset(len(entries))
 
+	if cap(a.posCachePods) < len(entries) {
+		a.posCachePods = make([]posCacheEntry, len(entries))
+	} else {
+		a.posCachePods = a.posCachePods[:len(entries)]
+	}
+
 	weightCacheDirect := &a.weightCacheDirect
 	weightCacheSet := a.weightCacheSet
 
@@ -1031,8 +1038,10 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		e := &entries[i]
 		if i > 0 {
 			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
+			podMatch := *(*uintptr)(unsafe.Pointer(&prev.PodIdentifier)) == *(*uintptr)(unsafe.Pointer(&e.PodIdentifier)) && len(prev.PodIdentifier) == len(e.PodIdentifier)
+			tierMatch := *(*uintptr)(unsafe.Pointer(&prev.DeviceTier)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(prev.DeviceTier) == len(e.DeviceTier)
+			if (podMatch || prev.PodIdentifier == e.PodIdentifier) &&
+				(tierMatch || prev.DeviceTier == e.DeviceTier) &&
 				prev.Speculative == e.Speculative {
 				continue
 			}
@@ -1042,7 +1051,8 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		var podOrd uint32
 		h := fastHash(e.PodIdentifier)
 		idx := h & 2047
-		if stringIdentical(a.podCache[idx].name, e.PodIdentifier) || a.podCache[idx].name == e.PodIdentifier {
+		cacheMatch := *(*uintptr)(unsafe.Pointer(&a.podCache[idx].name)) == *(*uintptr)(unsafe.Pointer(&e.PodIdentifier)) && len(a.podCache[idx].name) == len(e.PodIdentifier)
+		if cacheMatch || a.podCache[idx].name == e.PodIdentifier {
 			podOrd = a.podCache[idx].ord
 		} else {
 			podOrd = a.podOrdinal(e.PodIdentifier)
@@ -1071,16 +1081,21 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			tierOrd = speculativeTierOrdinal
 		} else {
 			tier = e.DeviceTier
-			if a.hasLastTier && (stringIdentical(a.lastTierName, e.DeviceTier) || a.lastTierName == e.DeviceTier) {
+			lastTierMatch := *(*uintptr)(unsafe.Pointer(&a.lastTierName)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.lastTierName) == len(e.DeviceTier)
+			if a.hasLastTier && (lastTierMatch || a.lastTierName == e.DeviceTier) {
 				tierOrd = a.lastTierOrd
 			} else {
-				if stringIdentical(a.tierCache[0].name, e.DeviceTier) || a.tierCache[0].name == e.DeviceTier {
+				t0Match := *(*uintptr)(unsafe.Pointer(&a.tierCache[0].name)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.tierCache[0].name) == len(e.DeviceTier)
+				t1Match := *(*uintptr)(unsafe.Pointer(&a.tierCache[1].name)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.tierCache[1].name) == len(e.DeviceTier)
+				t2Match := *(*uintptr)(unsafe.Pointer(&a.tierCache[2].name)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.tierCache[2].name) == len(e.DeviceTier)
+				t3Match := *(*uintptr)(unsafe.Pointer(&a.tierCache[3].name)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.tierCache[3].name) == len(e.DeviceTier)
+				if t0Match || a.tierCache[0].name == e.DeviceTier {
 					tierOrd = a.tierCache[0].ord
-				} else if stringIdentical(a.tierCache[1].name, e.DeviceTier) || a.tierCache[1].name == e.DeviceTier {
+				} else if t1Match || a.tierCache[1].name == e.DeviceTier {
 					tierOrd = a.tierCache[1].ord
-				} else if stringIdentical(a.tierCache[2].name, e.DeviceTier) || a.tierCache[2].name == e.DeviceTier {
+				} else if t2Match || a.tierCache[2].name == e.DeviceTier {
 					tierOrd = a.tierCache[2].ord
-				} else if stringIdentical(a.tierCache[3].name, e.DeviceTier) || a.tierCache[3].name == e.DeviceTier {
+				} else if t3Match || a.tierCache[3].name == e.DeviceTier {
 					tierOrd = a.tierCache[3].ord
 				} else {
 					tierOrd = a.tierOrdinal(e.DeviceTier)
@@ -1182,15 +1197,15 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
+		if i < len(a.posCachePods) {
+			a.posCachePods[i] = posCacheEntry{
 				podName:       e.PodIdentifier,
 				tierName:      e.DeviceTier,
-				speculative:   e.Speculative,
+				weight:        w,
 				podOrd:        podOrd,
 				tierOrd:       tierOrd,
 				slot:          s,
-				weight:        w,
+				speculative:   e.Speculative,
 				confirmed:     tierOrd != speculativeTierOrdinal,
 				isSingleTier0: !slot.isMultiTier && slot.hasTier0 && slot.tier0Ordinal == tierOrd && tierOrd != speculativeTierOrdinal,
 			}
@@ -1210,6 +1225,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	keyStamp := a.keyStamp
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
+	posCachePods := a.posCachePods
 
 	for i := range entries {
 		e := &entries[i]
@@ -1220,22 +1236,17 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		var tier string
 		var ok bool
 
-		if i < 256 {
-			entry := &a.posCache256[i]
-			if (stringIdentical(entry.podName, e.PodIdentifier) || entry.podName == e.PodIdentifier) &&
-				(stringIdentical(entry.tierName, e.DeviceTier) || entry.tierName == e.DeviceTier) &&
+		if i < len(posCachePods) {
+			entry := &posCachePods[i]
+			podMatch := *(*uintptr)(unsafe.Pointer(&entry.podName)) == *(*uintptr)(unsafe.Pointer(&e.PodIdentifier)) && len(entry.podName) == len(e.PodIdentifier)
+			tierMatch := *(*uintptr)(unsafe.Pointer(&entry.tierName)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(entry.tierName) == len(e.DeviceTier)
+			if (podMatch || entry.podName == e.PodIdentifier) &&
+				(tierMatch || entry.tierName == e.DeviceTier) &&
 				entry.speculative == e.Speculative {
 				s := entry.slot
 				slot := &slots[s]
 				if slot.seen < keyStamp-1 {
 					continue
-				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
@@ -1261,27 +1272,38 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						}
 					}
 				}
+				w := entry.weight
+				if slot.seen != keyStamp {
+					slot.seen = keyStamp
+					slot.weight = w
+				} else if w > slot.weight {
+					slot.weight = w
+				}
 				continue
 			}
 		}
 
 		if i > 0 {
 			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
+			podMatch := *(*uintptr)(unsafe.Pointer(&prev.PodIdentifier)) == *(*uintptr)(unsafe.Pointer(&e.PodIdentifier)) && len(prev.PodIdentifier) == len(e.PodIdentifier)
+			tierMatch := *(*uintptr)(unsafe.Pointer(&prev.DeviceTier)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(prev.DeviceTier) == len(e.DeviceTier)
+			if (podMatch || prev.PodIdentifier == e.PodIdentifier) &&
+				(tierMatch || prev.DeviceTier == e.DeviceTier) &&
 				prev.Speculative == e.Speculative {
 				continue
 			}
 		}
 
 		var found bool
-		if a.hasMru && (stringIdentical(a.mruName, e.PodIdentifier) || a.mruName == e.PodIdentifier) {
+		mruMatch := *(*uintptr)(unsafe.Pointer(&a.mruName)) == *(*uintptr)(unsafe.Pointer(&e.PodIdentifier)) && len(a.mruName) == len(e.PodIdentifier)
+		if a.hasMru && (mruMatch || a.mruName == e.PodIdentifier) {
 			podOrd = a.mruOrd
 			found = true
 		} else {
 			h := fastHash(e.PodIdentifier)
 			idx := h & 2047
-			if stringIdentical(a.podCache[idx].name, e.PodIdentifier) || a.podCache[idx].name == e.PodIdentifier {
+			cacheMatch := *(*uintptr)(unsafe.Pointer(&a.podCache[idx].name)) == *(*uintptr)(unsafe.Pointer(&e.PodIdentifier)) && len(a.podCache[idx].name) == len(e.PodIdentifier)
+			if cacheMatch || a.podCache[idx].name == e.PodIdentifier {
 				podOrd = a.podCache[idx].ord
 				found = true
 			} else {
@@ -1312,16 +1334,21 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			tierOrd = speculativeTierOrdinal
 		} else {
 			tier = e.DeviceTier
-			if a.hasLastTier && (stringIdentical(a.lastTierName, e.DeviceTier) || a.lastTierName == e.DeviceTier) {
+			lastTierMatch := *(*uintptr)(unsafe.Pointer(&a.lastTierName)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.lastTierName) == len(e.DeviceTier)
+			if a.hasLastTier && (lastTierMatch || a.lastTierName == e.DeviceTier) {
 				tierOrd = a.lastTierOrd
 			} else {
-				if stringIdentical(a.tierCache[0].name, e.DeviceTier) || a.tierCache[0].name == e.DeviceTier {
+				t0Match := *(*uintptr)(unsafe.Pointer(&a.tierCache[0].name)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.tierCache[0].name) == len(e.DeviceTier)
+				t1Match := *(*uintptr)(unsafe.Pointer(&a.tierCache[1].name)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.tierCache[1].name) == len(e.DeviceTier)
+				t2Match := *(*uintptr)(unsafe.Pointer(&a.tierCache[2].name)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.tierCache[2].name) == len(e.DeviceTier)
+				t3Match := *(*uintptr)(unsafe.Pointer(&a.tierCache[3].name)) == *(*uintptr)(unsafe.Pointer(&e.DeviceTier)) && len(a.tierCache[3].name) == len(e.DeviceTier)
+				if t0Match || a.tierCache[0].name == e.DeviceTier {
 					tierOrd = a.tierCache[0].ord
-				} else if stringIdentical(a.tierCache[1].name, e.DeviceTier) || a.tierCache[1].name == e.DeviceTier {
+				} else if t1Match || a.tierCache[1].name == e.DeviceTier {
 					tierOrd = a.tierCache[1].ord
-				} else if stringIdentical(a.tierCache[2].name, e.DeviceTier) || a.tierCache[2].name == e.DeviceTier {
+				} else if t2Match || a.tierCache[2].name == e.DeviceTier {
 					tierOrd = a.tierCache[2].ord
-				} else if stringIdentical(a.tierCache[3].name, e.DeviceTier) || a.tierCache[3].name == e.DeviceTier {
+				} else if t3Match || a.tierCache[3].name == e.DeviceTier {
 					tierOrd = a.tierCache[3].ord
 				} else {
 					tierOrd = a.tierOrdinal(e.DeviceTier)
@@ -1392,15 +1419,15 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
+		if i < len(posCachePods) {
+			posCachePods[i] = posCacheEntry{
 				podName:       e.PodIdentifier,
 				tierName:      e.DeviceTier,
-				speculative:   e.Speculative,
+				weight:        w,
 				podOrd:        podOrd,
 				tierOrd:       tierOrd,
 				slot:          s,
-				weight:        w,
+				speculative:   e.Speculative,
 				confirmed:     tierOrd != speculativeTierOrdinal,
 				isSingleTier0: !slot.isMultiTier && slot.hasTier0 && slot.tier0Ordinal == tierOrd && tierOrd != speculativeTierOrdinal,
 			}

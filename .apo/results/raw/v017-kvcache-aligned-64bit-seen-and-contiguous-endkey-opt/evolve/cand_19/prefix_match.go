@@ -250,11 +250,13 @@ func (t *slotTable) reset(numEntries int) {
 
 func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 	buckets := t.buckets
-	if len(buckets) == 0 {
+	n := len(buckets)
+	if n == 0 {
 		return 0, false
 	}
-	mask := uint32(len(buckets) - 1)
+	mask := uint32(n - 1)
 	i := (ordinal * 2654435761) & mask
+	_ = buckets[mask]
 	for {
 		b := buckets[i]
 		if b == 0 {
@@ -269,8 +271,13 @@ func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 
 func (t *slotTable) insert(ordinal uint32, slot int32) {
 	buckets := t.buckets
-	mask := uint32(len(buckets) - 1)
+	n := len(buckets)
+	if n == 0 {
+		return
+	}
+	mask := uint32(n - 1)
 	i := (ordinal * 2654435761) & mask
+	_ = buckets[mask]
 	for buckets[i] != 0 {
 		i = (i + 1) & mask
 	}
@@ -314,7 +321,7 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [7]byte // Padding to align to exactly 128 bytes
+	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {
@@ -631,7 +638,13 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 
 	posCache := a.posCache
 	slots := a.slots
+	if len(slots) == 0 {
+		return false
+	}
+	slotsPtr := unsafe.Pointer(&slots[0])
+	slotSize := unsafe.Sizeof(matchSlot{})
 	keyStamp := a.keyStamp
+	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	mru := a.mru
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
@@ -643,7 +656,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			entry := &posCache[i]
 			if *(*uint64)(unsafe.Pointer(&ref.PodOrdinal)) == entry.podAndRawTier && entry.refSpeculative == ref.Speculative {
 				s := entry.slot
-				slot := &slots[s]
+				slot := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(s)*slotSize))
 				if slot.seen < keyStamp-1 {
 					continue
 				}
@@ -655,7 +668,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
-					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
+					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
 				} else {
 					if entry.confirmed {
 						slot.confirmedSeen = keyStamp
@@ -705,7 +718,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		if !ok {
 			continue // the first key fixes the candidate set
 		}
-		slot := &slots[s]
+		slot := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(s)*slotSize))
 		if slot.seen < keyStamp-1 {
 			continue // entries for dead slots should be pruned early
 		}
@@ -754,19 +767,26 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			slot.weight = w
 		}
 
-		// stampTier inline
-		if !slot.isMultiTier {
-			if slot.tier0Ordinal == tierOrdinal {
-				slot.tier0Seen = keyStamp
-			}
+		// stampTier inline with single 64-bit store optimization where possible
+		if !slot.isMultiTier && slot.hasTier0 && slot.tier0Ordinal == tierOrdinal && tierOrdinal != speculativeTierOrdinal {
+			*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
 		} else {
-			if slot.tiers[0].ordinal == tierOrdinal {
-				slot.tiers[0].seen = keyStamp
+			if tierOrdinal != speculativeTierOrdinal {
+				slot.confirmedSeen = keyStamp
+			}
+			if !slot.isMultiTier {
+				if slot.tier0Ordinal == tierOrdinal {
+					slot.tier0Seen = keyStamp
+				}
 			} else {
-				for t := 1; t < len(slot.tiers); t++ {
-					if slot.tiers[t].ordinal == tierOrdinal {
-						slot.tiers[t].seen = keyStamp
-						break
+				if slot.tiers[0].ordinal == tierOrdinal {
+					slot.tiers[0].seen = keyStamp
+				} else {
+					for t := 1; t < len(slot.tiers); t++ {
+						if slot.tiers[t].ordinal == tierOrdinal {
+							slot.tiers[t].seen = keyStamp
+							break
+						}
 					}
 				}
 			}
@@ -795,7 +815,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 func (a *prefixAccumulator) endKey() bool {
 	keyStamp := a.keyStamp
 	slots := a.slots
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	if a.first {
 		a.first = false
 		nSlots := len(slots)
@@ -826,20 +845,48 @@ func (a *prefixAccumulator) endKey() bool {
 
 	active := a.active
 	n := len(active)
-	idx := 0
+	if n == 0 {
+		return false
+	}
+	if len(slots) == 0 {
+		return false
+	}
+	slotsPtr := unsafe.Pointer(&slots[0])
+	slotSize := unsafe.Sizeof(matchSlot{})
+	activePtr := unsafe.Pointer(&active[0])
+	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 
-	if len(active) == len(slots) {
+	if n == len(slots) {
+		idx := 0
 		for ; idx < n; idx++ {
-			s := &slots[idx]
+			s := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(idx)*slotSize))
 			if s.seen != keyStamp {
 				break
 			}
 			s.matched++
 			s.score += s.weight
-			if !s.isMultiTier {
-				if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
-					s.confirmed++
-					s.tier0Count++
+			
+			flags := *(*uint32)(unsafe.Pointer(&s.confirmedAlive))
+			if (flags & 0xFF00FFFF) == 0x00000101 && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+				s.confirmed++
+				s.tier0Count++
+			} else {
+				if s.isMultiTier {
+					if s.confirmedAlive && s.confirmedSeen == keyStamp {
+						s.confirmed++
+					} else {
+						s.confirmedAlive = false
+					}
+					for t := range s.tiers {
+						tc := &s.tiers[t]
+						if tc.alive {
+							if tc.seen == keyStamp {
+								tc.count++
+							} else {
+								tc.alive = false
+							}
+						}
+					}
 				} else {
 					if s.confirmedAlive {
 						if s.confirmedSeen == keyStamp {
@@ -853,57 +900,84 @@ func (a *prefixAccumulator) endKey() bool {
 							s.tier0Count++
 						} else {
 							s.tier0Alive = false
-						}
-					}
-				}
-			} else {
-				if s.confirmedAlive && s.confirmedSeen == keyStamp {
-					s.confirmed++
-				} else {
-					s.confirmedAlive = false
-				}
-				for t := range s.tiers {
-					tc := &s.tiers[t]
-					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
 						}
 					}
 				}
 			}
 		}
-	} else {
-		for ; idx < n; idx++ {
-			i := active[idx]
-			s := &slots[i]
-			if s.seen != keyStamp {
-				break
-			}
-			s.matched++
-			s.score += s.weight
-			if !s.isMultiTier {
-				if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+
+		if idx < n {
+			keepCount := idx
+			for j := idx + 1; j < n; j++ {
+				s := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(j)*slotSize))
+				if s.seen != keyStamp {
+					continue
+				}
+				s.matched++
+				s.score += s.weight
+				
+				flags := *(*uint32)(unsafe.Pointer(&s.confirmedAlive))
+				if (flags & 0xFF00FFFF) == 0x00000101 && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
 					s.confirmed++
 					s.tier0Count++
 				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
+					if s.isMultiTier {
+						if s.confirmedAlive && s.confirmedSeen == keyStamp {
 							s.confirmed++
 						} else {
 							s.confirmedAlive = false
 						}
-					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
+						for t := range s.tiers {
+							tc := &s.tiers[t]
+							if tc.alive {
+								if tc.seen == keyStamp {
+									tc.count++
+								} else {
+									tc.alive = false
+								}
+							}
+						}
+					} else {
+						if s.confirmedAlive {
+							if s.confirmedSeen == keyStamp {
+								s.confirmed++
+							} else {
+								s.confirmedAlive = false
+							}
+						}
+						if s.tier0Alive {
+							if s.tier0Seen == keyStamp {
+								s.tier0Count++
+							} else {
+								s.tier0Alive = false
+							}
 						}
 					}
 				}
-			} else {
+				*(*int32)(unsafe.Pointer(uintptr(activePtr) + uintptr(keepCount)*4)) = int32(j)
+				keepCount++
+			}
+			a.active = active[:keepCount]
+		}
+		return len(a.active) > 0
+	}
+
+	idx := 0
+	for ; idx < n; idx++ {
+		i := *(*int32)(unsafe.Pointer(uintptr(activePtr) + uintptr(idx)*4))
+		s := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(i)*slotSize))
+		if s.seen != keyStamp {
+			break
+		}
+		s.matched++
+		s.score += s.weight
+		
+		flags := *(*uint32)(unsafe.Pointer(&s.confirmedAlive))
+		if (flags & 0xFF00FFFF) == 0x00000101 && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+			s.confirmed++
+			s.tier0Count++
+		} else {
+			if s.isMultiTier {
 				if s.confirmedAlive && s.confirmedSeen == keyStamp {
 					s.confirmed++
 				} else {
@@ -917,6 +991,21 @@ func (a *prefixAccumulator) endKey() bool {
 						} else {
 							tc.alive = false
 						}
+					}
+				}
+			} else {
+				if s.confirmedAlive {
+					if s.confirmedSeen == keyStamp {
+						s.confirmed++
+					} else {
+						s.confirmedAlive = false
+					}
+				}
+				if s.tier0Alive {
+					if s.tier0Seen == keyStamp {
+						s.tier0Count++
+					} else {
+						s.tier0Alive = false
 					}
 				}
 			}
@@ -926,17 +1015,35 @@ func (a *prefixAccumulator) endKey() bool {
 	if idx < n {
 		keepCount := idx
 		for j := idx + 1; j < n; j++ {
-			i := active[j]
-			s := &slots[i]
+			i := *(*int32)(unsafe.Pointer(uintptr(activePtr) + uintptr(j)*4))
+			s := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(i)*slotSize))
 			if s.seen != keyStamp {
 				continue
 			}
 			s.matched++
 			s.score += s.weight
-			if !s.isMultiTier {
-				if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
-					s.confirmed++
-					s.tier0Count++
+			
+			flags := *(*uint32)(unsafe.Pointer(&s.confirmedAlive))
+			if (flags & 0xFF00FFFF) == 0x00000101 && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+				s.confirmed++
+				s.tier0Count++
+			} else {
+				if s.isMultiTier {
+					if s.confirmedAlive && s.confirmedSeen == keyStamp {
+						s.confirmed++
+					} else {
+						s.confirmedAlive = false
+					}
+					for t := range s.tiers {
+						tc := &s.tiers[t]
+						if tc.alive {
+							if tc.seen == keyStamp {
+								tc.count++
+							} else {
+								tc.alive = false
+							}
+						}
+					}
 				} else {
 					if s.confirmedAlive {
 						if s.confirmedSeen == keyStamp {
@@ -953,24 +1060,8 @@ func (a *prefixAccumulator) endKey() bool {
 						}
 					}
 				}
-			} else {
-				if s.confirmedAlive && s.confirmedSeen == keyStamp {
-					s.confirmed++
-				} else {
-					s.confirmedAlive = false
-				}
-				for t := range s.tiers {
-					tc := &s.tiers[t]
-					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
-						}
-					}
-				}
 			}
-			active[keepCount] = i
+			*(*int32)(unsafe.Pointer(uintptr(activePtr) + uintptr(keepCount)*4)) = i
 			keepCount++
 		}
 		a.active = active[:keepCount]
@@ -1207,7 +1298,13 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	}
 
 	slots := a.slots
+	if len(slots) == 0 {
+		return false
+	}
+	slotsPtr := unsafe.Pointer(&slots[0])
+	slotSize := unsafe.Sizeof(matchSlot{})
 	keyStamp := a.keyStamp
+	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
@@ -1226,7 +1323,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				(stringIdentical(entry.tierName, e.DeviceTier) || entry.tierName == e.DeviceTier) &&
 				entry.speculative == e.Speculative {
 				s := entry.slot
-				slot := &slots[s]
+				slot := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(s)*slotSize))
 				if slot.seen < keyStamp-1 {
 					continue
 				}
@@ -1238,7 +1335,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
-					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
+					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
 				} else {
 					if entry.confirmed {
 						slot.confirmedSeen = keyStamp
@@ -1307,6 +1404,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			continue
 		}
 
+		slot := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(s)*slotSize))
+		if slot.seen < keyStamp-1 {
+			continue
+		}
+
 		if e.Speculative || e.DeviceTier == SpeculativeTier {
 			tier = SpeculativeTier
 			tierOrd = speculativeTierOrdinal
@@ -1345,11 +1447,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		slot := &slots[s]
-		if slot.seen < keyStamp-1 {
-			continue
-		}
-
 		if tierOrd != speculativeTierOrdinal {
 			slot.confirmedSeen = keyStamp
 		}
@@ -1375,18 +1472,26 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			slot.weight = w
 		}
 
-		if !slot.isMultiTier {
-			if slot.tier0Ordinal == tierOrd {
-				slot.tier0Seen = keyStamp
-			}
+		// stampTier inline with single 64-bit store optimization where possible
+		if !slot.isMultiTier && slot.hasTier0 && slot.tier0Ordinal == tierOrd && tierOrd != speculativeTierOrdinal {
+			*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
 		} else {
-			if slot.tiers[0].ordinal == tierOrd {
-				slot.tiers[0].seen = keyStamp
+			if tierOrd != speculativeTierOrdinal {
+				slot.confirmedSeen = keyStamp
+			}
+			if !slot.isMultiTier {
+				if slot.tier0Ordinal == tierOrd {
+					slot.tier0Seen = keyStamp
+				}
 			} else {
-				for t := 1; t < len(slot.tiers); t++ {
-					if slot.tiers[t].ordinal == tierOrd {
-						slot.tiers[t].seen = keyStamp
-						break
+				if slot.tiers[0].ordinal == tierOrd {
+					slot.tiers[0].seen = keyStamp
+				} else {
+					for t := 1; t < len(slot.tiers); t++ {
+						if slot.tiers[t].ordinal == tierOrd {
+							slot.tiers[t].seen = keyStamp
+							break
+						}
 					}
 				}
 			}

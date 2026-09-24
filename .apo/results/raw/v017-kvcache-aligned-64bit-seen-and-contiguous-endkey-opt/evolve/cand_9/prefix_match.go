@@ -314,7 +314,7 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [7]byte // Padding to align to exactly 128 bytes
+	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {
@@ -481,12 +481,17 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	} else {
 		a.posCache = a.posCache[:len(entries)]
 	}
-	for i := range a.posCache {
-		a.posCache[i].podAndRawTier = ^uint64(0)
+	posCache := a.posCache
+	for i := range posCache {
+		posCache[i].podAndRawTier = ^uint64(0)
 	}
 
 	weightCacheDirect := &a.weightCacheDirect
 	weightCacheSet := a.weightCacheSet
+
+	var lastPodOrd uint32 = math.MaxUint32
+	var lastS int32
+	var lastOk bool
 
 	for i := range entries {
 		ref := &entries[i]
@@ -498,13 +503,27 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 			}
 		}
 
-		s, ok := a.table.lookup(ref.PodOrdinal)
-		if !ok {
-			if a.hasFilter && !a.filter.Has(ref.PodIdentifier) {
+		var s int32
+		if i > 0 && ref.PodOrdinal == lastPodOrd {
+			if !lastOk {
 				continue
 			}
-			s = a.newSlot(ref.PodIdentifier)
-			a.table.insert(ref.PodOrdinal, s)
+			s = lastS
+		} else {
+			var ok bool
+			s, ok = a.table.lookup(ref.PodOrdinal)
+			if !ok {
+				if a.hasFilter && !a.filter.Has(ref.PodIdentifier) {
+					lastPodOrd = ref.PodOrdinal
+					lastOk = false
+					continue
+				}
+				s = a.newSlot(ref.PodIdentifier)
+				a.table.insert(ref.PodOrdinal, s)
+			}
+			lastPodOrd = ref.PodOrdinal
+			lastS = s
+			lastOk = true
 		}
 
 		slot := &a.slots[s]
@@ -605,8 +624,8 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 			}
 		}
 
-		if i < len(a.posCache) {
-			a.posCache[i] = posCacheEntryKey{
+		if i < len(posCache) {
+			posCache[i] = posCacheEntryKey{
 				podAndRawTier:  uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32),
 				slot:           s,
 				weight:         w,
@@ -636,6 +655,10 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
+	var lastPodOrd uint32 = math.MaxUint32
+	var lastS int32
+	var lastOk bool
+
 	for i := range entries {
 		ref := &entries[i]
 
@@ -645,14 +668,9 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				s := entry.slot
 				slot := &slots[s]
 				if slot.seen < keyStamp-1 {
+					lastPodOrd = ref.PodOrdinal
+					lastOk = false
 					continue
-				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
@@ -678,6 +696,16 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 						}
 					}
 				}
+				w := entry.weight
+				if slot.seen != keyStamp {
+					slot.seen = keyStamp
+					slot.weight = w
+				} else if w > slot.weight {
+					slot.weight = w
+				}
+				lastPodOrd = ref.PodOrdinal
+				lastS = s
+				lastOk = true
 				continue
 			}
 		}
@@ -691,22 +719,35 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		}
 
 		var s int32
-		var ok bool
-		if uint32(mru>>32) == ref.PodOrdinal {
-			s = int32(mru)
-			ok = true
-		} else {
-			s, ok = a.table.lookup(ref.PodOrdinal)
-			if ok {
-				mru = (uint64(ref.PodOrdinal) << 32) | uint64(uint32(s))
+		if i > 0 && ref.PodOrdinal == lastPodOrd {
+			if !lastOk {
+				continue
 			}
+			s = lastS
+		} else {
+			var ok bool
+			if uint32(mru>>32) == ref.PodOrdinal {
+				s = int32(mru)
+				ok = true
+			} else {
+				s, ok = a.table.lookup(ref.PodOrdinal)
+				if ok {
+					mru = (uint64(ref.PodOrdinal) << 32) | uint64(uint32(s))
+				}
+			}
+			if !ok {
+				lastPodOrd = ref.PodOrdinal
+				lastOk = false
+				continue
+			}
+			lastPodOrd = ref.PodOrdinal
+			lastS = s
+			lastOk = true
 		}
 
-		if !ok {
-			continue // the first key fixes the candidate set
-		}
 		slot := &slots[s]
 		if slot.seen < keyStamp-1 {
+			lastOk = false
 			continue // entries for dead slots should be pruned early
 		}
 
@@ -795,7 +836,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 func (a *prefixAccumulator) endKey() bool {
 	keyStamp := a.keyStamp
 	slots := a.slots
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	if a.first {
 		a.first = false
 		nSlots := len(slots)
@@ -824,11 +864,12 @@ func (a *prefixAccumulator) endKey() bool {
 		return len(a.active) > 0
 	}
 
+	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	active := a.active
 	n := len(active)
 	idx := 0
 
-	if len(active) == len(slots) {
+	if n == len(slots) {
 		for ; idx < n; idx++ {
 			s := &slots[idx]
 			if s.seen != keyStamp {
@@ -925,53 +966,103 @@ func (a *prefixAccumulator) endKey() bool {
 
 	if idx < n {
 		keepCount := idx
-		for j := idx + 1; j < n; j++ {
-			i := active[j]
-			s := &slots[i]
-			if s.seen != keyStamp {
-				continue
-			}
-			s.matched++
-			s.score += s.weight
-			if !s.isMultiTier {
-				if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
-					s.confirmed++
-					s.tier0Count++
+		if n == len(slots) {
+			for j := idx + 1; j < n; j++ {
+				s := &slots[j]
+				if s.seen != keyStamp {
+					continue
+				}
+				s.matched++
+				s.score += s.weight
+				if !s.isMultiTier {
+					if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+						s.confirmed++
+						s.tier0Count++
+					} else {
+						if s.confirmedAlive {
+							if s.confirmedSeen == keyStamp {
+								s.confirmed++
+							} else {
+								s.confirmedAlive = false
+							}
+						}
+						if s.tier0Alive {
+							if s.tier0Seen == keyStamp {
+								s.tier0Count++
+							} else {
+								s.tier0Alive = false
+							}
+						}
+					}
 				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
-							s.confirmed++
-						} else {
-							s.confirmedAlive = false
-						}
+					if s.confirmedAlive && s.confirmedSeen == keyStamp {
+						s.confirmed++
+					} else {
+						s.confirmedAlive = false
 					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
-						}
-					}
-				}
-			} else {
-				if s.confirmedAlive && s.confirmedSeen == keyStamp {
-					s.confirmed++
-				} else {
-					s.confirmedAlive = false
-				}
-				for t := range s.tiers {
-					tc := &s.tiers[t]
-					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
+					for t := range s.tiers {
+						tc := &s.tiers[t]
+						if tc.alive {
+							if tc.seen == keyStamp {
+								tc.count++
+							} else {
+								tc.alive = false
+							}
 						}
 					}
 				}
+				active[keepCount] = int32(j)
+				keepCount++
 			}
-			active[keepCount] = i
-			keepCount++
+		} else {
+			for j := idx + 1; j < n; j++ {
+				i := active[j]
+				s := &slots[i]
+				if s.seen != keyStamp {
+					continue
+				}
+				s.matched++
+				s.score += s.weight
+				if !s.isMultiTier {
+					if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+						s.confirmed++
+						s.tier0Count++
+					} else {
+						if s.confirmedAlive {
+							if s.confirmedSeen == keyStamp {
+								s.confirmed++
+							} else {
+								s.confirmedAlive = false
+							}
+						}
+						if s.tier0Alive {
+							if s.tier0Seen == keyStamp {
+								s.tier0Count++
+							} else {
+								s.tier0Alive = false
+							}
+						}
+					}
+				} else {
+					if s.confirmedAlive && s.confirmedSeen == keyStamp {
+						s.confirmed++
+					} else {
+						s.confirmedAlive = false
+					}
+					for t := range s.tiers {
+						tc := &s.tiers[t]
+						if tc.alive {
+							if tc.seen == keyStamp {
+								tc.count++
+							} else {
+								tc.alive = false
+							}
+						}
+					}
+				}
+				active[keepCount] = i
+				keepCount++
+			}
 		}
 		a.active = active[:keepCount]
 	}
@@ -1211,6 +1302,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
+	var lastPodName string
+	var lastPodOrd uint32
+	var lastS int32
+	var lastOk bool
+
 	for i := range entries {
 		e := &entries[i]
 
@@ -1218,7 +1314,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		var podOrd uint32
 		var tierOrd uint32
 		var tier string
-		var ok bool
 
 		if i < 256 {
 			entry := &a.posCache256[i]
@@ -1228,14 +1323,9 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				s := entry.slot
 				slot := &slots[s]
 				if slot.seen < keyStamp-1 {
+					lastPodName = e.PodIdentifier
+					lastOk = false
 					continue
-				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
@@ -1261,6 +1351,17 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						}
 					}
 				}
+				w := entry.weight
+				if slot.seen != keyStamp {
+					slot.seen = keyStamp
+					slot.weight = w
+				} else if w > slot.weight {
+					slot.weight = w
+				}
+				lastPodName = e.PodIdentifier
+				lastPodOrd = entry.podOrd
+				lastS = s
+				lastOk = true
 				continue
 			}
 		}
@@ -1274,36 +1375,59 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		var found bool
-		if a.hasMru && (stringIdentical(a.mruName, e.PodIdentifier) || a.mruName == e.PodIdentifier) {
-			podOrd = a.mruOrd
-			found = true
+		if i > 0 && (stringIdentical(lastPodName, e.PodIdentifier) || lastPodName == e.PodIdentifier) {
+			if !lastOk {
+				continue
+			}
+			podOrd = lastPodOrd
+			s = lastS
 		} else {
-			h := fastHash(e.PodIdentifier)
-			idx := h & 2047
-			if stringIdentical(a.podCache[idx].name, e.PodIdentifier) || a.podCache[idx].name == e.PodIdentifier {
-				podOrd = a.podCache[idx].ord
+			var found bool
+			if a.hasMru && (stringIdentical(a.mruName, e.PodIdentifier) || a.mruName == e.PodIdentifier) {
+				podOrd = a.mruOrd
 				found = true
 			} else {
-				podOrd, found = a.podsMap[e.PodIdentifier]
+				h := fastHash(e.PodIdentifier)
+				idx := h & 2047
+				if stringIdentical(a.podCache[idx].name, e.PodIdentifier) || a.podCache[idx].name == e.PodIdentifier {
+					podOrd = a.podCache[idx].ord
+					found = true
+				} else {
+					podOrd, found = a.podsMap[e.PodIdentifier]
+					if found {
+						a.podCache[idx].name = e.PodIdentifier
+						a.podCache[idx].ord = podOrd
+					}
+				}
 				if found {
-					a.podCache[idx].name = e.PodIdentifier
-					a.podCache[idx].ord = podOrd
+					a.mruName = e.PodIdentifier
+					a.mruOrd = podOrd
+					a.hasMru = true
 				}
 			}
-			if found {
-				a.mruName = e.PodIdentifier
-				a.mruOrd = podOrd
-				a.hasMru = true
+
+			if !found {
+				lastPodName = e.PodIdentifier
+				lastOk = false
+				continue
 			}
+
+			var ok bool
+			s, ok = a.table.lookup(podOrd)
+			if !ok {
+				lastPodName = e.PodIdentifier
+				lastOk = false
+				continue
+			}
+			lastPodName = e.PodIdentifier
+			lastPodOrd = podOrd
+			lastS = s
+			lastOk = true
 		}
 
-		if !found {
-			continue
-		}
-
-		s, ok = a.table.lookup(podOrd)
-		if !ok {
+		slot := &slots[s]
+		if slot.seen < keyStamp-1 {
+			lastOk = false
 			continue
 		}
 

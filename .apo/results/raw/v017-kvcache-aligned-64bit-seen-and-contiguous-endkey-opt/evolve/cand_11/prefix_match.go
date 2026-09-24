@@ -314,7 +314,7 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [7]byte // Padding to align to exactly 128 bytes
+	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {
@@ -488,10 +488,27 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	weightCacheDirect := &a.weightCacheDirect
 	weightCacheSet := a.weightCacheSet
 
-	for i := range entries {
-		ref := &entries[i]
+	nEntries := len(entries)
+	if nEntries == 0 {
+		return a.endKey()
+	}
+
+	var entriesPtr *kvblock.EntryRef
+	entriesPtr = &entries[0]
+
+	var posCachePtr *posCacheEntryKey
+	nPos := len(a.posCache)
+	if nPos > 0 {
+		posCachePtr = &a.posCache[0]
+	}
+
+	entryRefSize := unsafe.Sizeof(kvblock.EntryRef{})
+	posCacheEntrySize := unsafe.Sizeof(posCacheEntryKey{})
+
+	for i := 0; i < nEntries; i++ {
+		ref := (*kvblock.EntryRef)(unsafe.Pointer(uintptr(unsafe.Pointer(entriesPtr)) + uintptr(i)*entryRefSize))
 		if i > 0 {
-			prev := &entries[i-1]
+			prev := (*kvblock.EntryRef)(unsafe.Pointer(uintptr(unsafe.Pointer(entriesPtr)) + uintptr(i-1)*entryRefSize))
 			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
 				ref.Speculative == prev.Speculative {
 				continue
@@ -605,16 +622,15 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 			}
 		}
 
-		if i < len(a.posCache) {
-			a.posCache[i] = posCacheEntryKey{
-				podAndRawTier:  uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32),
-				slot:           s,
-				weight:         w,
-				confirmed:      tierOrdinal != speculativeTierOrdinal,
-				tierOrd:        tierOrdinal,
-				refSpeculative: ref.Speculative,
-				isSingleTier0:  !slot.isMultiTier && slot.hasTier0 && slot.tier0Ordinal == tierOrdinal && tierOrdinal != speculativeTierOrdinal,
-			}
+		if i < nPos {
+			entry := (*posCacheEntryKey)(unsafe.Pointer(uintptr(unsafe.Pointer(posCachePtr)) + uintptr(i)*posCacheEntrySize))
+			entry.podAndRawTier = uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32)
+			entry.slot = s
+			entry.weight = w
+			entry.confirmed = tierOrdinal != speculativeTierOrdinal
+			entry.tierOrd = tierOrdinal
+			entry.refSpeculative = ref.Speculative
+			entry.isSingleTier0 = !slot.isMultiTier && slot.hasTier0 && slot.tier0Ordinal == tierOrdinal && tierOrdinal != speculativeTierOrdinal
 		}
 	}
 	a.weightCacheSet = weightCacheSet
@@ -636,23 +652,38 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
-	for i := range entries {
-		ref := &entries[i]
+	nEntries := len(entries)
+	if nEntries == 0 {
+		return a.endKey()
+	}
 
-		if i < len(posCache) {
-			entry := &posCache[i]
+	var entriesPtr *kvblock.EntryRef
+	entriesPtr = &entries[0]
+
+	var posCachePtr *posCacheEntryKey
+	nPos := len(posCache)
+	if nPos > 0 {
+		posCachePtr = &posCache[0]
+	}
+
+	var slotsPtr *matchSlot
+	if len(slots) > 0 {
+		slotsPtr = &slots[0]
+	}
+
+	entryRefSize := unsafe.Sizeof(kvblock.EntryRef{})
+	posCacheEntrySize := unsafe.Sizeof(posCacheEntryKey{})
+
+	for i := 0; i < nEntries; i++ {
+		ref := (*kvblock.EntryRef)(unsafe.Pointer(uintptr(unsafe.Pointer(entriesPtr)) + uintptr(i)*entryRefSize))
+
+		if i < nPos {
+			entry := (*posCacheEntryKey)(unsafe.Pointer(uintptr(unsafe.Pointer(posCachePtr)) + uintptr(i)*posCacheEntrySize))
 			if *(*uint64)(unsafe.Pointer(&ref.PodOrdinal)) == entry.podAndRawTier && entry.refSpeculative == ref.Speculative {
 				s := entry.slot
-				slot := &slots[s]
+				slot := (*matchSlot)(unsafe.Pointer(uintptr(unsafe.Pointer(slotsPtr)) + uintptr(s)*128))
 				if slot.seen < keyStamp-1 {
 					continue
-				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
@@ -678,12 +709,19 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 						}
 					}
 				}
+				w := entry.weight
+				if slot.seen != keyStamp {
+					slot.seen = keyStamp
+					slot.weight = w
+				} else if w > slot.weight {
+					slot.weight = w
+				}
 				continue
 			}
 		}
 
 		if i > 0 {
-			prev := &entries[i-1]
+			prev := (*kvblock.EntryRef)(unsafe.Pointer(uintptr(unsafe.Pointer(entriesPtr)) + uintptr(i-1)*entryRefSize))
 			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
 				ref.Speculative == prev.Speculative {
 				continue
@@ -705,7 +743,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		if !ok {
 			continue // the first key fixes the candidate set
 		}
-		slot := &slots[s]
+		slot := (*matchSlot)(unsafe.Pointer(uintptr(unsafe.Pointer(slotsPtr)) + uintptr(s)*128))
 		if slot.seen < keyStamp-1 {
 			continue // entries for dead slots should be pruned early
 		}
@@ -772,16 +810,15 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			}
 		}
 
-		if i < len(posCache) {
-			posCache[i] = posCacheEntryKey{
-				podAndRawTier:  uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32),
-				slot:           s,
-				weight:         w,
-				confirmed:      tierOrdinal != speculativeTierOrdinal,
-				tierOrd:        tierOrdinal,
-				refSpeculative: ref.Speculative,
-				isSingleTier0:  !slot.isMultiTier && slot.hasTier0 && slot.tier0Ordinal == tierOrdinal && tierOrdinal != speculativeTierOrdinal,
-			}
+		if i < nPos {
+			entry := (*posCacheEntryKey)(unsafe.Pointer(uintptr(unsafe.Pointer(posCachePtr)) + uintptr(i)*posCacheEntrySize))
+			entry.podAndRawTier = uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32)
+			entry.slot = s
+			entry.weight = w
+			entry.confirmed = tierOrdinal != speculativeTierOrdinal
+			entry.tierOrd = tierOrdinal
+			entry.refSpeculative = ref.Speculative
+			entry.isSingleTier0 = !slot.isMultiTier && slot.hasTier0 && slot.tier0Ordinal == tierOrdinal && tierOrdinal != speculativeTierOrdinal
 		}
 	}
 	a.mru = mru
@@ -795,7 +832,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 func (a *prefixAccumulator) endKey() bool {
 	keyStamp := a.keyStamp
 	slots := a.slots
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	if a.first {
 		a.first = false
 		nSlots := len(slots)
@@ -824,13 +860,24 @@ func (a *prefixAccumulator) endKey() bool {
 		return len(a.active) > 0
 	}
 
+	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	active := a.active
 	n := len(active)
 	idx := 0
 
-	if len(active) == len(slots) {
+	var slotsPtr *matchSlot
+	if len(slots) > 0 {
+		slotsPtr = &slots[0]
+	}
+
+	var activePtr *int32
+	if n > 0 {
+		activePtr = &active[0]
+	}
+
+	if n == len(slots) {
 		for ; idx < n; idx++ {
-			s := &slots[idx]
+			s := (*matchSlot)(unsafe.Pointer(uintptr(unsafe.Pointer(slotsPtr)) + uintptr(idx)*128))
 			if s.seen != keyStamp {
 				break
 			}
@@ -876,8 +923,8 @@ func (a *prefixAccumulator) endKey() bool {
 		}
 	} else {
 		for ; idx < n; idx++ {
-			i := active[idx]
-			s := &slots[i]
+			i := *(*int32)(unsafe.Pointer(uintptr(unsafe.Pointer(activePtr)) + uintptr(idx)*4))
+			s := (*matchSlot)(unsafe.Pointer(uintptr(unsafe.Pointer(slotsPtr)) + uintptr(i)*128))
 			if s.seen != keyStamp {
 				break
 			}
@@ -926,8 +973,8 @@ func (a *prefixAccumulator) endKey() bool {
 	if idx < n {
 		keepCount := idx
 		for j := idx + 1; j < n; j++ {
-			i := active[j]
-			s := &slots[i]
+			i := *(*int32)(unsafe.Pointer(uintptr(unsafe.Pointer(activePtr)) + uintptr(j)*4))
+			s := (*matchSlot)(unsafe.Pointer(uintptr(unsafe.Pointer(slotsPtr)) + uintptr(i)*128))
 			if s.seen != keyStamp {
 				continue
 			}
@@ -970,7 +1017,7 @@ func (a *prefixAccumulator) endKey() bool {
 					}
 				}
 			}
-			active[keepCount] = i
+			*(*int32)(unsafe.Pointer(uintptr(unsafe.Pointer(activePtr)) + uintptr(keepCount)*4)) = i
 			keepCount++
 		}
 		a.active = active[:keepCount]
@@ -1230,13 +1277,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				if slot.seen < keyStamp-1 {
 					continue
 				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
-				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
 				} else {
@@ -1260,6 +1300,13 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 							}
 						}
 					}
+				}
+				w := entry.weight
+				if slot.seen != keyStamp {
+					slot.seen = keyStamp
+					slot.weight = w
+				} else if w > slot.weight {
+					slot.weight = w
 				}
 				continue
 			}

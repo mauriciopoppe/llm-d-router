@@ -647,13 +647,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				if slot.seen < keyStamp-1 {
 					continue
 				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
-				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
 				} else {
@@ -677,6 +670,13 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 							}
 						}
 					}
+				}
+				w := entry.weight
+				if slot.seen != keyStamp {
+					slot.seen = keyStamp
+					slot.weight = w
+				} else if w > slot.weight {
+					slot.weight = w
 				}
 				continue
 			}
@@ -795,7 +795,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 func (a *prefixAccumulator) endKey() bool {
 	keyStamp := a.keyStamp
 	slots := a.slots
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	if a.first {
 		a.first = false
 		nSlots := len(slots)
@@ -824,11 +823,12 @@ func (a *prefixAccumulator) endKey() bool {
 		return len(a.active) > 0
 	}
 
+	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
 	active := a.active
 	n := len(active)
-	idx := 0
 
-	if len(active) == len(slots) {
+	if n == len(slots) {
+		idx := 0
 		for ; idx < n; idx++ {
 			s := &slots[idx]
 			if s.seen != keyStamp {
@@ -874,49 +874,103 @@ func (a *prefixAccumulator) endKey() bool {
 				}
 			}
 		}
-	} else {
-		for ; idx < n; idx++ {
-			i := active[idx]
-			s := &slots[i]
-			if s.seen != keyStamp {
-				break
+
+		if idx < n {
+			keepCount := idx
+			for j := idx + 1; j < n; j++ {
+				s := &slots[j]
+				if s.seen != keyStamp {
+					continue
+				}
+				s.matched++
+				s.score += s.weight
+				if !s.isMultiTier {
+					if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+						s.confirmed++
+						s.tier0Count++
+					} else {
+						if s.confirmedAlive {
+							if s.confirmedSeen == keyStamp {
+								s.confirmed++
+							} else {
+								s.confirmedAlive = false
+							}
+						}
+						if s.tier0Alive {
+							if s.tier0Seen == keyStamp {
+								s.tier0Count++
+							} else {
+								s.tier0Alive = false
+							}
+						}
+					}
+				} else {
+					if s.confirmedAlive && s.confirmedSeen == keyStamp {
+						s.confirmed++
+					} else {
+						s.confirmedAlive = false
+					}
+					for t := range s.tiers {
+						tc := &s.tiers[t]
+						if tc.alive {
+							if tc.seen == keyStamp {
+								tc.count++
+							} else {
+								tc.alive = false
+							}
+						}
+					}
+				}
+				active[keepCount] = int32(j)
+				keepCount++
 			}
-			s.matched++
-			s.score += s.weight
-			if !s.isMultiTier {
-				if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
-					s.confirmed++
-					s.tier0Count++
-				} else {
-					if s.confirmedAlive {
-						if s.confirmedSeen == keyStamp {
-							s.confirmed++
-						} else {
-							s.confirmedAlive = false
-						}
-					}
-					if s.tier0Alive {
-						if s.tier0Seen == keyStamp {
-							s.tier0Count++
-						} else {
-							s.tier0Alive = false
-						}
-					}
-				}
+			a.active = active[:keepCount]
+		}
+		return len(a.active) > 0
+	}
+
+	idx := 0
+	for ; idx < n; idx++ {
+		i := active[idx]
+		s := &slots[i]
+		if s.seen != keyStamp {
+			break
+		}
+		s.matched++
+		s.score += s.weight
+		if !s.isMultiTier {
+			if s.confirmedAlive && s.tier0Alive && *(*uint64)(unsafe.Pointer(&s.confirmedSeen)) == expectedSeen {
+				s.confirmed++
+				s.tier0Count++
 			} else {
-				if s.confirmedAlive && s.confirmedSeen == keyStamp {
-					s.confirmed++
-				} else {
-					s.confirmedAlive = false
+				if s.confirmedAlive {
+					if s.confirmedSeen == keyStamp {
+						s.confirmed++
+					} else {
+						s.confirmedAlive = false
+					}
 				}
-				for t := range s.tiers {
-					tc := &s.tiers[t]
-					if tc.alive {
-						if tc.seen == keyStamp {
-							tc.count++
-						} else {
-							tc.alive = false
-						}
+				if s.tier0Alive {
+					if s.tier0Seen == keyStamp {
+						s.tier0Count++
+					} else {
+						s.tier0Alive = false
+					}
+				}
+			}
+		} else {
+			if s.confirmedAlive && s.confirmedSeen == keyStamp {
+				s.confirmed++
+			} else {
+				s.confirmedAlive = false
+			}
+			for t := range s.tiers {
+				tc := &s.tiers[t]
+				if tc.alive {
+					if tc.seen == keyStamp {
+						tc.count++
+					} else {
+						tc.alive = false
 					}
 				}
 			}
@@ -1230,13 +1284,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				if slot.seen < keyStamp-1 {
 					continue
 				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
-				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
 				} else {
@@ -1260,6 +1307,13 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 							}
 						}
 					}
+				}
+				w := entry.weight
+				if slot.seen != keyStamp {
+					slot.seen = keyStamp
+					slot.weight = w
+				} else if w > slot.weight {
+					slot.weight = w
 				}
 				continue
 			}
