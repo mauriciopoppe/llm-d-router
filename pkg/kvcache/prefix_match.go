@@ -20,6 +20,7 @@ import (
 	"context"
 	"math"
 	"sync"
+	"unsafe"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -153,6 +154,11 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 		return nil, err
 	}
 	return matchMaterialized(ctx, keys, keyToPods, weights, filter)
+}
+
+// stringIdentical reports whether two strings have identical backing data and length.
+func stringIdentical(a, b string) bool {
+	return unsafe.StringData(a) == unsafe.StringData(b) && len(a) == len(b)
 }
 
 // EVOLVE-BLOCK-START
