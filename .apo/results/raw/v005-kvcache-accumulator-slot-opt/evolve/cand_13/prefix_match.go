@@ -439,11 +439,12 @@ func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 	i := (ordinal * 2654435761) & mask
 	for {
 		b := buckets[i]
-		if b == 0 {
+		slot := uint32(b)
+		if slot == 0 {
 			return 0, false
 		}
 		if uint32(b>>32) == ordinal {
-			return int32(uint32(b) - 1), true
+			return int32(slot - 1), true
 		}
 		i = (i + 1) & mask
 	}
@@ -453,7 +454,7 @@ func (t *slotTable) insert(ordinal uint32, slot int32) {
 	buckets := t.buckets
 	mask := uint32(len(buckets) - 1)
 	i := (ordinal * 2654435761) & mask
-	for buckets[i] != 0 {
+	for uint32(buckets[i]) != 0 {
 		i = (i + 1) & mask
 	}
 	buckets[i] = (uint64(ordinal) << 32) | uint64(slot+1)
@@ -634,6 +635,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 			} else {
 				w = a.weightOf(tier, tierOrdinal)
 				weightCacheSet = a.weightCacheSet
+				weightCacheDirect[tierOrdinal] = w
 			}
 		} else if tierOrdinal == speculativeTierOrdinal && a.speculativeWeightSet {
 			w = a.speculativeWeight
@@ -728,6 +730,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			} else {
 				w = a.weightOf(tier, tierOrdinal)
 				weightCacheSet = a.weightCacheSet
+				weightCacheDirect[tierOrdinal] = w
 			}
 		} else if tierOrdinal == speculativeTierOrdinal && a.speculativeWeightSet {
 			w = a.speculativeWeight
@@ -856,7 +859,11 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 	for i := range a.slots {
 		s := &a.slots[i]
 		var byTier map[string]int
-		if n := len(s.tiers); n > 0 {
+		n := len(s.tiers)
+		if n == 1 {
+			tc := s.tiers[0]
+			byTier = map[string]int{tc.name: tc.count}
+		} else if n > 1 {
 			byTier = make(map[string]int, n)
 			for j := 0; j < n; j++ {
 				tc := &s.tiers[j]

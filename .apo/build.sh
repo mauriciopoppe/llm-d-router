@@ -8,7 +8,7 @@ source .apo/set-env.sh 2>/dev/null || true
 
 echo "Executing pre-flight compilation and unit tests for ./pkg/kvcache..."
 EXIT_CODE=0
-go test -count=1 ./pkg/kvcache > "$RESULTS_DIR/build_output.log" 2>&1 || EXIT_CODE=$?
+go test -timeout=30s -count=1 ./pkg/kvcache > "$RESULTS_DIR/build_output.log" 2>&1 || EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
   cat "$RESULTS_DIR/build_output.log" >&2 || true

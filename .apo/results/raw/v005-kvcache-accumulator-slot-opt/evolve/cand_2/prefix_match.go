@@ -436,14 +436,15 @@ func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 		return 0, false
 	}
 	mask := uint32(len(buckets) - 1)
-	i := (ordinal * 2654435761) & mask
+	i := ordinal * 2654435761 & mask
 	for {
 		b := buckets[i]
-		if b == 0 {
+		slot := uint32(b)
+		if slot == 0 {
 			return 0, false
 		}
 		if uint32(b>>32) == ordinal {
-			return int32(uint32(b) - 1), true
+			return int32(slot - 1), true
 		}
 		i = (i + 1) & mask
 	}
@@ -452,8 +453,8 @@ func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 func (t *slotTable) insert(ordinal uint32, slot int32) {
 	buckets := t.buckets
 	mask := uint32(len(buckets) - 1)
-	i := (ordinal * 2654435761) & mask
-	for buckets[i] != 0 {
+	i := ordinal * 2654435761 & mask
+	for uint32(buckets[i]) != 0 {
 		i = (i + 1) & mask
 	}
 	buckets[i] = (uint64(ordinal) << 32) | uint64(slot+1)
@@ -505,7 +506,6 @@ type matchSlot struct {
 type prefixAccumulator struct {
 	weights map[string]float64
 	filter  sets.Set[string]
-	hasFilter bool
 
 	table    slotTable
 	slots    []matchSlot
@@ -521,12 +521,15 @@ type prefixAccumulator struct {
 	tiersMap map[string]uint32
 	refsBuf  []kvblock.EntryRef
 
-	posCache             []uint64
-	mru                  uint64
-	weightCacheDirect    [64]float64
-	weightCacheSet       uint64
-	speculativeWeight    float64
-	speculativeWeightSet bool
+	// Positional cache for fast slot lookup across consecutive keys
+	posPodOrd []uint32
+	posSlot   []int32
+	mruPodOrd uint32
+	mruSlot   int32
+
+	// Direct weight cache by ordinal
+	weightCacheDirect []float64
+	weightCacheValid  []bool
 }
 
 var accumulatorPool = sync.Pool{New: func() any {
@@ -535,21 +538,24 @@ var accumulatorPool = sync.Pool{New: func() any {
 		slots[i].tiers = make([]tierChain, 0, 4)
 	}
 	return &prefixAccumulator{
-		table:       slotTable{buckets: make([]uint64, 512)},
-		slots:       slots[:0],
-		active:      make([]int32, 0, 256),
-		weightCache: make([]tierWeight, 0, 8),
-		podsMap:     make(map[string]uint32, 128),
-		tiersMap:    make(map[string]uint32, 16),
-		refsBuf:     make([]kvblock.EntryRef, 0, 512),
-		posCache:    make([]uint64, 0, 512),
+		table:             slotTable{buckets: make([]uint64, 512)},
+		slots:             slots[:0],
+		active:            make([]int32, 0, 256),
+		weightCache:       make([]tierWeight, 0, 8),
+		podsMap:           make(map[string]uint32, 128),
+		tiersMap:          make(map[string]uint32, 16),
+		refsBuf:           make([]kvblock.EntryRef, 0, 512),
+		posPodOrd:         make([]uint32, 0, 256),
+		posSlot:           make([]int32, 0, 256),
+		mruSlot:           -1,
+		weightCacheDirect: make([]float64, 64),
+		weightCacheValid:  make([]bool, 64),
 	}
 }}
 
 func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *prefixAccumulator {
 	a := accumulatorPool.Get().(*prefixAccumulator)
 	a.weights, a.filter = weights, filter
-	a.hasFilter = filter.Len() > 0
 	a.slots = a.slots[:0]
 	a.active = a.active[:0]
 	a.keyStamp = 0
@@ -567,9 +573,18 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	}
 	clear(a.refsBuf)
 	a.refsBuf = a.refsBuf[:0]
-	a.mru = ^uint64(0)
-	a.weightCacheSet = 0
-	a.speculativeWeightSet = false
+
+	a.posPodOrd = a.posPodOrd[:0]
+	a.posSlot = a.posSlot[:0]
+	a.mruPodOrd = 0
+	a.mruSlot = -1
+
+	if a.weightCacheDirect == nil {
+		a.weightCacheDirect = make([]float64, 64)
+		a.weightCacheValid = make([]bool, 64)
+	} else {
+		clear(a.weightCacheValid)
+	}
 	return a
 }
 
@@ -584,17 +599,16 @@ func releaseAccumulator(a *prefixAccumulator) {
 // keyFirst is the cold path for folding the very first key's entries.
 func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	a.table.reset(len(entries))
-	if cap(a.posCache) < len(entries) {
-		a.posCache = make([]uint64, len(entries))
+	if cap(a.posPodOrd) < len(entries) {
+		a.posPodOrd = make([]uint32, len(entries))
+		a.posSlot = make([]int32, len(entries))
 	} else {
-		a.posCache = a.posCache[:len(entries)]
+		a.posPodOrd = a.posPodOrd[:len(entries)]
+		a.posSlot = a.posSlot[:len(entries)]
 	}
-	for i := range a.posCache {
-		a.posCache[i] = uint64(^uint32(0)) << 32
+	for i := range a.posPodOrd {
+		a.posPodOrd[i] = 0xFFFFFFFF
 	}
-
-	weightCacheDirect := &a.weightCacheDirect
-	weightCacheSet := a.weightCacheSet
 
 	var prev *kvblock.EntryRef
 	for i := range entries {
@@ -607,17 +621,12 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 
 		s, ok := a.table.lookup(ref.PodOrdinal)
 		if !ok {
-			if a.hasFilter && !a.filter.Has(ref.PodIdentifier) {
+			if a.filter.Len() > 0 && !a.filter.Has(ref.PodIdentifier) {
 				continue
 			}
 			s = a.newSlot(ref.PodIdentifier)
 			a.table.insert(ref.PodOrdinal, s)
 		}
-
-		if i < len(a.posCache) {
-			a.posCache[i] = (uint64(ref.PodOrdinal) << 32) | uint64(uint32(s))
-		}
-
 		slot := &a.slots[s]
 
 		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
@@ -627,20 +636,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 			slot.confirmedSeen = a.keyStamp
 		}
 
-		var w float64
-		if tierOrdinal < 64 {
-			if (weightCacheSet & (1 << tierOrdinal)) != 0 {
-				w = weightCacheDirect[tierOrdinal]
-			} else {
-				w = a.weightOf(tier, tierOrdinal)
-				weightCacheSet = a.weightCacheSet
-			}
-		} else if tierOrdinal == speculativeTierOrdinal && a.speculativeWeightSet {
-			w = a.speculativeWeight
-		} else {
-			w = a.weightOf(tier, tierOrdinal)
-		}
-
+		w := a.weightOf(tier, tierOrdinal)
 		if slot.seen != a.keyStamp {
 			slot.seen = a.keyStamp
 			slot.weight = w
@@ -651,8 +647,10 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 		if !a.stampTier(slot, tierOrdinal) {
 			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
 		}
+
+		a.posPodOrd[i] = ref.PodOrdinal
+		a.posSlot[i] = s
 	}
-	a.weightCacheSet = weightCacheSet
 	return a.endKey()
 }
 
@@ -664,12 +662,23 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		return a.keyFirst(entries)
 	}
 
-	posCache := a.posCache
-	slots := a.slots
-	keyStamp := a.keyStamp
-	mru := a.mru
-	weightCacheSet := a.weightCacheSet
-	weightCacheDirect := &a.weightCacheDirect
+	if len(entries) > len(a.posPodOrd) {
+		oldLen := len(a.posPodOrd)
+		if cap(a.posPodOrd) < len(entries) {
+			newPosPod := make([]uint32, len(entries))
+			copy(newPosPod, a.posPodOrd)
+			a.posPodOrd = newPosPod
+			newPosSlot := make([]int32, len(entries))
+			copy(newPosSlot, a.posSlot)
+			a.posSlot = newPosSlot
+		} else {
+			a.posPodOrd = a.posPodOrd[:len(entries)]
+			a.posSlot = a.posSlot[:len(entries)]
+		}
+		for j := oldLen; j < len(entries); j++ {
+			a.posPodOrd[j] = 0xFFFFFFFF
+		}
+	}
 
 	var prev *kvblock.EntryRef
 	for i := range entries {
@@ -684,24 +693,20 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 
 		var s int32
 		var ok bool
-		if i < len(posCache) {
-			val := posCache[i]
-			if uint32(val>>32) == ref.PodOrdinal {
-				s = int32(val)
-				ok = true
-			}
-		}
-		if !ok {
-			if uint32(mru>>32) == ref.PodOrdinal {
-				s = int32(mru)
-				ok = true
-			} else {
-				s, ok = a.table.lookup(ref.PodOrdinal)
-				if ok {
-					mru = (uint64(ref.PodOrdinal) << 32) | uint64(uint32(s))
-					if i < len(posCache) {
-						posCache[i] = mru
-					}
+		if i < len(a.posPodOrd) && a.posPodOrd[i] == ref.PodOrdinal {
+			s = a.posSlot[i]
+			ok = true
+		} else if ref.PodOrdinal == a.mruPodOrd && a.mruSlot != -1 {
+			s = a.mruSlot
+			ok = true
+		} else {
+			s, ok = a.table.lookup(ref.PodOrdinal)
+			if ok {
+				a.mruPodOrd = ref.PodOrdinal
+				a.mruSlot = s
+				if i < len(a.posPodOrd) {
+					a.posPodOrd[i] = ref.PodOrdinal
+					a.posSlot[i] = s
 				}
 			}
 		}
@@ -709,8 +714,8 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		if !ok {
 			continue // the first key fixes the candidate set
 		}
-		slot := &slots[s]
-		if slot.seen < keyStamp-1 {
+		slot := &a.slots[s]
+		if slot.seen < a.keyStamp-1 {
 			continue // entries for dead slots should be pruned early
 		}
 
@@ -718,47 +723,19 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
 			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
 		} else {
-			slot.confirmedSeen = keyStamp
+			slot.confirmedSeen = a.keyStamp
 		}
 
-		var w float64
-		if tierOrdinal < 64 {
-			if (weightCacheSet & (1 << tierOrdinal)) != 0 {
-				w = weightCacheDirect[tierOrdinal]
-			} else {
-				w = a.weightOf(tier, tierOrdinal)
-				weightCacheSet = a.weightCacheSet
-			}
-		} else if tierOrdinal == speculativeTierOrdinal && a.speculativeWeightSet {
-			w = a.speculativeWeight
-		} else {
-			w = a.weightOf(tier, tierOrdinal)
-		}
-
-		if slot.seen != keyStamp {
-			slot.seen = keyStamp
+		w := a.weightOf(tier, tierOrdinal)
+		if slot.seen != a.keyStamp {
+			slot.seen = a.keyStamp
 			slot.weight = w
 		} else if w > slot.weight {
 			slot.weight = w
 		}
 
-		// stampTier inline
-		tiers := slot.tiers
-		if len(tiers) > 0 {
-			if tiers[0].ordinal == tierOrdinal {
-				tiers[0].seen = keyStamp
-			} else if len(tiers) > 1 {
-				for t := 1; t < len(tiers); t++ {
-					if tiers[t].ordinal == tierOrdinal {
-						tiers[t].seen = keyStamp
-						break
-					}
-				}
-			}
-		}
+		_ = a.stampTier(slot, tierOrdinal)
 	}
-	a.mru = mru
-	a.weightCacheSet = weightCacheSet
 	return a.endKey()
 }
 
@@ -766,16 +743,17 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 // slot tracks that tier.
 func (a *prefixAccumulator) stampTier(slot *matchSlot, tierOrdinal uint32) bool {
 	tiers := slot.tiers
-	if len(tiers) > 0 {
+	if len(tiers) == 1 {
 		if tiers[0].ordinal == tierOrdinal {
 			tiers[0].seen = a.keyStamp
 			return true
 		}
-		for i := 1; i < len(tiers); i++ {
-			if tiers[i].ordinal == tierOrdinal {
-				tiers[i].seen = a.keyStamp
-				return true
-			}
+		return false
+	}
+	for i := range tiers {
+		if tiers[i].ordinal == tierOrdinal {
+			tiers[i].seen = a.keyStamp
+			return true
 		}
 	}
 	return false
@@ -784,23 +762,17 @@ func (a *prefixAccumulator) stampTier(slot *matchSlot, tierOrdinal uint32) bool 
 // endKey closes the current key and reports whether any chain is still
 // alive.
 func (a *prefixAccumulator) endKey() bool {
-	keyStamp := a.keyStamp
-	slots := a.slots
 	if a.first {
 		a.first = false
-		for i := range slots {
-			s := &slots[i]
+		for i := range a.slots {
+			s := &a.slots[i]
 			s.matched, s.score = 1, s.weight
-			if s.confirmedSeen == keyStamp {
+			if s.confirmedSeen == a.keyStamp {
 				s.confirmed, s.confirmedAlive = 1, true
 			}
 			tiers := s.tiers
-			if len(tiers) == 1 {
-				tiers[0].count = 1
-			} else {
-				for t := range tiers {
-					tiers[t].count = 1
-				}
+			for t := range tiers {
+				tiers[t].count = 1
 			}
 			a.active = append(a.active, int32(i))
 		}
@@ -809,38 +781,27 @@ func (a *prefixAccumulator) endKey() bool {
 
 	keep := a.active[:0]
 	for _, i := range a.active {
-		s := &slots[i]
-		if s.seen != keyStamp {
+		s := &a.slots[i]
+		if s.seen != a.keyStamp {
 			continue // the chain ends at the first key the pod does not hold
 		}
 		s.matched++
 		s.score += s.weight
 		if s.confirmedAlive {
-			if s.confirmedSeen == keyStamp {
+			if s.confirmedSeen == a.keyStamp {
 				s.confirmed++
 			} else {
 				s.confirmedAlive = false
 			}
 		}
 		tiers := s.tiers
-		if len(tiers) == 1 {
-			tc := &tiers[0]
+		for t := range tiers {
+			tc := &tiers[t]
 			if tc.alive {
-				if tc.seen == keyStamp {
+				if tc.seen == a.keyStamp {
 					tc.count++
 				} else {
 					tc.alive = false
-				}
-			}
-		} else {
-			for t := range tiers {
-				tc := &tiers[t]
-				if tc.alive {
-					if tc.seen == keyStamp {
-						tc.count++
-					} else {
-						tc.alive = false
-					}
 				}
 			}
 		}
@@ -897,32 +858,28 @@ func (a *prefixAccumulator) newSlot(pod string) int32 {
 // weightOf resolves a tier's weight, caching by ordinal so the configured
 // map is consulted once per tier per accumulation.
 func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
-	if ordinal < 64 {
-		if (a.weightCacheSet & (1 << ordinal)) != 0 {
+	if ordinal < uint32(len(a.weightCacheValid)) {
+		if a.weightCacheValid[ordinal] {
 			return a.weightCacheDirect[ordinal]
 		}
-		w := unknownTierWeight
-		if tier == SpeculativeTier {
-			w = speculativeTierWeight
-		} else if configured, ok := a.weights[tier]; ok {
-			w = configured
+	} else if ordinal < 4096 {
+		newLen := int(ordinal) + 1
+		if newLen < 64 {
+			newLen = 64
 		}
-		a.weightCacheDirect[ordinal] = w
-		a.weightCacheSet |= (1 << ordinal)
-		return w
+		if cap(a.weightCacheDirect) < newLen {
+			oldDirect := a.weightCacheDirect
+			a.weightCacheDirect = make([]float64, newLen*2)
+			copy(a.weightCacheDirect, oldDirect)
+			oldValid := a.weightCacheValid
+			a.weightCacheValid = make([]bool, newLen*2)
+			copy(a.weightCacheValid, oldValid)
+		} else {
+			a.weightCacheDirect = a.weightCacheDirect[:newLen]
+			a.weightCacheValid = a.weightCacheValid[:newLen]
+		}
 	}
-	if ordinal == speculativeTierOrdinal {
-		if a.speculativeWeightSet {
-			return a.speculativeWeight
-		}
-		w := speculativeTierWeight
-		if configured, ok := a.weights[tier]; ok {
-			w = configured
-		}
-		a.speculativeWeight = w
-		a.speculativeWeightSet = true
-		return w
-	}
+
 	for i := range a.weightCache {
 		if a.weightCache[i].ordinal == ordinal {
 			return a.weightCache[i].weight
@@ -936,6 +893,10 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 		w = configured
 	}
 	a.weightCache = append(a.weightCache, tierWeight{ordinal: ordinal, weight: w})
+	if ordinal < uint32(len(a.weightCacheValid)) {
+		a.weightCacheDirect[ordinal] = w
+		a.weightCacheValid[ordinal] = true
+	}
 	return w
 }
 
