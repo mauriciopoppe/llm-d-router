@@ -314,7 +314,7 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [7]byte // Padding to align to exactly 128 bytes
+	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {

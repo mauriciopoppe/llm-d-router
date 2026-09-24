@@ -162,6 +162,8 @@ func stringIdentical(a, b string) bool {
 }
 
 // EVOLVE-BLOCK-START
+import "unsafe"
+
 func fastHash(s string) uint32 {
 	n := len(s)
 	if n < 4 {
@@ -314,7 +316,7 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [7]byte // Padding to align to exactly 128 bytes
+	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {
@@ -560,7 +562,6 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 					stamped = true
 				} else {
 					// Fallback to multi-tier
-					slot.isMultiTier = true
 					slot.tiers = append(slot.tiers, tierChain{
 						ordinal: slot.tier0Ordinal,
 						name:    slot.tier0Name,
@@ -574,6 +575,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 						seen:    a.keyStamp,
 						alive:   true,
 					})
+					slot.isMultiTier = true
 					stamped = true
 				}
 			} else {
@@ -600,6 +602,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 					seen:    a.keyStamp,
 					alive:   true,
 				})
+				slot.isMultiTier = true
 			}
 		}
 
@@ -1081,7 +1084,6 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 					stamped = true
 				} else {
 					// Fallback to multi-tier
-					slot.isMultiTier = true
 					slot.tiers = append(slot.tiers, tierChain{
 						ordinal: slot.tier0Ordinal,
 						name:    slot.tier0Name,
@@ -1095,6 +1097,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 						seen:    a.keyStamp,
 						alive:   true,
 					})
+					slot.isMultiTier = true
 					stamped = true
 				}
 			} else {
@@ -1121,6 +1124,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 					seen:    a.keyStamp,
 					alive:   true,
 				})
+				slot.isMultiTier = true
 			}
 		}
 
@@ -1363,16 +1367,17 @@ func (a *prefixAccumulator) newSlot(pod string) int32 {
 		s.confirmedSeen = 0
 		s.confirmedAlive = false
 		s.hasTier0 = false
-		s.isMultiTier = false
 		s.tier0Ordinal = 0
 		s.tier0Seen = 0
 		s.tier0Count = 0
 		s.tier0Alive = false
 		s.tier0Name = ""
+		s.isMultiTier = false
 	} else {
 		a.slots = append(a.slots, matchSlot{
-			pod:   pod,
-			tiers: make([]tierChain, 0, 4),
+			pod:         pod,
+			tiers:       make([]tierChain, 0, 4),
+			isMultiTier: false,
 		})
 	}
 	return int32(n)

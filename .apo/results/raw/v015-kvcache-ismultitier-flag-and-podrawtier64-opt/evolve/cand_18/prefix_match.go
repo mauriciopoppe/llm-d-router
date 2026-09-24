@@ -162,19 +162,25 @@ func stringIdentical(a, b string) bool {
 }
 
 // EVOLVE-BLOCK-START
+import "unsafe"
+
 func fastHash(s string) uint32 {
 	n := len(s)
+	if n == 0 {
+		return 0
+	}
+	strPtr := *(*unsafe.Pointer)(unsafe.Pointer(&s))
 	if n < 4 {
-		if n == 0 {
-			return 0
-		}
-		h := uint32(s[0])
+		h := uint32(*(*byte)(strPtr))
 		for i := 1; i < n; i++ {
-			h = h*31 + uint32(s[i])
+			h = h*31 + uint32(*(*byte)(unsafe.Pointer(uintptr(strPtr) + uintptr(i))))
 		}
 		return h
 	}
-	return uint32(s[0])*50625 + uint32(s[n/2])*1351 + uint32(s[n-2])*31 + uint32(s[n-1])
+	return uint32(*(*byte)(strPtr))*50625 +
+		uint32(*(*byte)(unsafe.Pointer(uintptr(strPtr) + uintptr(n/2))))*1351 +
+		uint32(*(*byte)(unsafe.Pointer(uintptr(strPtr) + uintptr(n-2))))*31 +
+		uint32(*(*byte)(unsafe.Pointer(uintptr(strPtr) + uintptr(n-1))))
 }
 
 func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
@@ -250,13 +256,15 @@ func (t *slotTable) reset(numEntries int) {
 
 func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 	buckets := t.buckets
-	if len(buckets) == 0 {
+	n := len(buckets)
+	if n == 0 {
 		return 0, false
 	}
-	mask := uint32(len(buckets) - 1)
+	bucketsPtr := unsafe.Pointer(&buckets[0])
+	mask := uint32(n - 1)
 	i := (ordinal * 2654435761) & mask
 	for {
-		b := buckets[i]
+		b := *(*uint64)(unsafe.Pointer(uintptr(bucketsPtr) + uintptr(i)*8))
 		if b == 0 {
 			return 0, false
 		}
@@ -269,12 +277,17 @@ func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 
 func (t *slotTable) insert(ordinal uint32, slot int32) {
 	buckets := t.buckets
+	bucketsPtr := unsafe.Pointer(&buckets[0])
 	mask := uint32(len(buckets) - 1)
 	i := (ordinal * 2654435761) & mask
-	for buckets[i] != 0 {
+	for {
+		b := *(*uint64)(unsafe.Pointer(uintptr(bucketsPtr) + uintptr(i)*8))
+		if b == 0 {
+			break
+		}
 		i = (i + 1) & mask
 	}
-	buckets[i] = (uint64(ordinal) << 32) | uint64(slot+1)
+	*(*uint64)(unsafe.Pointer(uintptr(bucketsPtr) + uintptr(i)*8)) = (uint64(ordinal) << 32) | uint64(slot+1)
 }
 
 // tierChain tracks one tier's contiguous prefix for a candidate pod.
@@ -314,7 +327,7 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [7]byte // Padding to align to exactly 128 bytes
+	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {
@@ -330,10 +343,10 @@ type posCacheEntry struct {
 
 type posCacheEntryKey struct {
 	podAndRawTier  uint64
-	slot           int32
 	weight         float64
-	confirmed      bool
+	slot           int32
 	tierOrd        uint32
+	confirmed      bool
 	refSpeculative bool
 }
 
@@ -479,17 +492,28 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	} else {
 		a.posCache = a.posCache[:len(entries)]
 	}
-	for i := range a.posCache {
-		a.posCache[i].podAndRawTier = ^uint64(0)
+	nEntries := len(entries)
+	var posCachePtr unsafe.Pointer
+	if len(a.posCache) > 0 {
+		posCachePtr = unsafe.Pointer(&a.posCache[0])
+	}
+	for i := 0; i < len(a.posCache); i++ {
+		entry := (*posCacheEntryKey)(unsafe.Pointer(uintptr(posCachePtr) + uintptr(i)*unsafe.Sizeof(posCacheEntryKey{})))
+		entry.podAndRawTier = ^uint64(0)
 	}
 
 	weightCacheDirect := &a.weightCacheDirect
 	weightCacheSet := a.weightCacheSet
 
-	for i := range entries {
-		ref := &entries[i]
+	var entriesPtr unsafe.Pointer
+	if nEntries > 0 {
+		entriesPtr = unsafe.Pointer(&entries[0])
+	}
+
+	for i := 0; i < nEntries; i++ {
+		ref := (*kvblock.EntryRef)(unsafe.Pointer(uintptr(entriesPtr) + uintptr(i)*unsafe.Sizeof(kvblock.EntryRef{})))
 		if i > 0 {
-			prev := &entries[i-1]
+			prev := (*kvblock.EntryRef)(unsafe.Pointer(uintptr(entriesPtr) + uintptr(i-1)*unsafe.Sizeof(kvblock.EntryRef{})))
 			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
 				ref.Speculative == prev.Speculative {
 				continue
@@ -604,14 +628,13 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 		}
 
 		if i < len(a.posCache) {
-			a.posCache[i] = posCacheEntryKey{
-				podAndRawTier:  uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32),
-				slot:           s,
-				weight:         w,
-				confirmed:      tierOrdinal != speculativeTierOrdinal,
-				tierOrd:        tierOrdinal,
-				refSpeculative: ref.Speculative,
-			}
+			entry := (*posCacheEntryKey)(unsafe.Pointer(uintptr(posCachePtr) + uintptr(i)*unsafe.Sizeof(posCacheEntryKey{})))
+			entry.podAndRawTier = uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32)
+			entry.slot = s
+			entry.weight = w
+			entry.confirmed = tierOrdinal != speculativeTierOrdinal
+			entry.tierOrd = tierOrdinal
+			entry.refSpeculative = ref.Speculative
 		}
 	}
 	a.weightCacheSet = weightCacheSet
@@ -633,14 +656,30 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
-	for i := range entries {
-		ref := &entries[i]
+	var entriesPtr unsafe.Pointer
+	if len(entries) > 0 {
+		entriesPtr = unsafe.Pointer(&entries[0])
+	}
+	var posCachePtr unsafe.Pointer
+	if len(posCache) > 0 {
+		posCachePtr = unsafe.Pointer(&posCache[0])
+	}
+	var slotsPtr unsafe.Pointer
+	if len(slots) > 0 {
+		slotsPtr = unsafe.Pointer(&slots[0])
+	}
 
-		if i < len(posCache) {
-			entry := &posCache[i]
+	nEntries := len(entries)
+	nPosCache := len(posCache)
+
+	for i := 0; i < nEntries; i++ {
+		ref := (*kvblock.EntryRef)(unsafe.Pointer(uintptr(entriesPtr) + uintptr(i)*unsafe.Sizeof(kvblock.EntryRef{})))
+
+		if i < nPosCache {
+			entry := (*posCacheEntryKey)(unsafe.Pointer(uintptr(posCachePtr) + uintptr(i)*unsafe.Sizeof(posCacheEntryKey{})))
 			if *(*uint64)(unsafe.Pointer(&ref.PodOrdinal)) == entry.podAndRawTier && entry.refSpeculative == ref.Speculative {
 				s := entry.slot
-				slot := &slots[s]
+				slot := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(s)*unsafe.Sizeof(matchSlot{})))
 				if slot.seen < keyStamp-1 {
 					continue
 				}
@@ -676,7 +715,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		}
 
 		if i > 0 {
-			prev := &entries[i-1]
+			prev := (*kvblock.EntryRef)(unsafe.Pointer(uintptr(entriesPtr) + uintptr(i-1)*unsafe.Sizeof(kvblock.EntryRef{})))
 			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
 				ref.Speculative == prev.Speculative {
 				continue
@@ -698,7 +737,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		if !ok {
 			continue // the first key fixes the candidate set
 		}
-		slot := &slots[s]
+		slot := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(s)*unsafe.Sizeof(matchSlot{})))
 		if slot.seen < keyStamp-1 {
 			continue // entries for dead slots should be pruned early
 		}
@@ -765,15 +804,14 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			}
 		}
 
-		if i < len(posCache) {
-			posCache[i] = posCacheEntryKey{
-				podAndRawTier:  uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32),
-				slot:           s,
-				weight:         w,
-				confirmed:      tierOrdinal != speculativeTierOrdinal,
-				tierOrd:        tierOrdinal,
-				refSpeculative: ref.Speculative,
-			}
+		if i < nPosCache {
+			entry := (*posCacheEntryKey)(unsafe.Pointer(uintptr(posCachePtr) + uintptr(i)*unsafe.Sizeof(posCacheEntryKey{})))
+			entry.podAndRawTier = uint64(ref.PodOrdinal) | (uint64(ref.TierOrdinal) << 32)
+			entry.slot = s
+			entry.weight = w
+			entry.confirmed = tierOrdinal != speculativeTierOrdinal
+			entry.tierOrd = tierOrdinal
+			entry.refSpeculative = ref.Speculative
 		}
 	}
 	a.mru = mru
@@ -795,8 +833,16 @@ func (a *prefixAccumulator) endKey() bool {
 		} else {
 			a.active = a.active[:nSlots]
 		}
-		for i := range slots {
-			s := &slots[i]
+		var slotsPtr unsafe.Pointer
+		if nSlots > 0 {
+			slotsPtr = unsafe.Pointer(&slots[0])
+		}
+		var activePtr unsafe.Pointer
+		if len(a.active) > 0 {
+			activePtr = unsafe.Pointer(&a.active[0])
+		}
+		for i := 0; i < nSlots; i++ {
+			s := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(i)*unsafe.Sizeof(matchSlot{})))
 			s.matched, s.score = 1, s.weight
 			if s.confirmedSeen == keyStamp {
 				s.confirmed, s.confirmedAlive = 1, true
@@ -810,7 +856,7 @@ func (a *prefixAccumulator) endKey() bool {
 					s.tiers[t].count = 1
 				}
 			}
-			a.active[i] = int32(i)
+			*(*int32)(unsafe.Pointer(uintptr(activePtr) + uintptr(i)*4)) = int32(i)
 		}
 		return len(a.active) > 0
 	}
@@ -818,9 +864,18 @@ func (a *prefixAccumulator) endKey() bool {
 	active := a.active
 	n := len(active)
 	idx := 0
+	var activePtr unsafe.Pointer
+	if n > 0 {
+		activePtr = unsafe.Pointer(&active[0])
+	}
+	var slotsPtr unsafe.Pointer
+	if len(slots) > 0 {
+		slotsPtr = unsafe.Pointer(&slots[0])
+	}
+
 	for ; idx < n; idx++ {
-		i := active[idx]
-		s := &slots[i]
+		i := *(*int32)(unsafe.Pointer(uintptr(activePtr) + uintptr(idx)*4))
+		s := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(i)*unsafe.Sizeof(matchSlot{})))
 		if s.seen != keyStamp {
 			break
 		}
@@ -868,8 +923,8 @@ func (a *prefixAccumulator) endKey() bool {
 	if idx < n {
 		keepCount := idx
 		for j := idx + 1; j < n; j++ {
-			i := active[j]
-			s := &slots[i]
+			i := *(*int32)(unsafe.Pointer(uintptr(activePtr) + uintptr(j)*4))
+			s := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(i)*unsafe.Sizeof(matchSlot{})))
 			if s.seen != keyStamp {
 				continue
 			}
@@ -912,7 +967,7 @@ func (a *prefixAccumulator) endKey() bool {
 					}
 				}
 			}
-			active[keepCount] = i
+			*(*int32)(unsafe.Pointer(uintptr(activePtr) + uintptr(keepCount)*4)) = i
 			keepCount++
 		}
 		a.active = active[:keepCount]
@@ -928,7 +983,7 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 		var byTier map[string]int
 		if !s.isMultiTier {
 			if s.hasTier0 {
-				if (stringIdentical(s.tier0Name, a.lastSingularName) || s.tier0Name == a.lastSingularName) && s.tier0Count == a.lastSingularCount {
+				if (*(*[2]uintptr)(unsafe.Pointer(&s.tier0Name)) == *(*[2]uintptr)(unsafe.Pointer(&a.lastSingularName)) || s.tier0Name == a.lastSingularName) && s.tier0Count == a.lastSingularCount {
 					byTier = a.lastSingularMap
 				} else {
 					slice := a.singularCache[s.tier0Name]
@@ -969,13 +1024,19 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 	weightCacheDirect := &a.weightCacheDirect
 	weightCacheSet := a.weightCacheSet
 
-	for i := range entries {
-		e := &entries[i]
+	var entriesPtr unsafe.Pointer
+	if len(entries) > 0 {
+		entriesPtr = unsafe.Pointer(&entries[0])
+	}
+
+	nEntries := len(entries)
+	for i := 0; i < nEntries; i++ {
+		e := (*kvblock.PodEntry)(unsafe.Pointer(uintptr(entriesPtr) + uintptr(i)*unsafe.Sizeof(kvblock.PodEntry{})))
 		if i > 0 {
-			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
-				prev.Speculative == e.Speculative {
+			prev := (*kvblock.PodEntry)(unsafe.Pointer(uintptr(entriesPtr) + uintptr(i-1)*unsafe.Sizeof(kvblock.PodEntry{})))
+			if ((*(*[2]uintptr)(unsafe.Pointer(&prev.PodIdentifier)) == *(*[2]uintptr)(unsafe.Pointer(&e.PodIdentifier)) || prev.PodIdentifier == e.PodIdentifier) &&
+				(*(*[2]uintptr)(unsafe.Pointer(&prev.DeviceTier)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || prev.DeviceTier == e.DeviceTier) &&
+				prev.Speculative == e.Speculative) {
 				continue
 			}
 		}
@@ -984,12 +1045,13 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		var podOrd uint32
 		h := fastHash(e.PodIdentifier)
 		idx := h & 2047
-		if stringIdentical(a.podCache[idx].name, e.PodIdentifier) || a.podCache[idx].name == e.PodIdentifier {
-			podOrd = a.podCache[idx].ord
+		cachedPod := &a.podCache[idx]
+		if *(*[2]uintptr)(unsafe.Pointer(&cachedPod.name)) == *(*[2]uintptr)(unsafe.Pointer(&e.PodIdentifier)) || cachedPod.name == e.PodIdentifier {
+			podOrd = cachedPod.ord
 		} else {
 			podOrd = a.podOrdinal(e.PodIdentifier)
-			a.podCache[idx].name = e.PodIdentifier
-			a.podCache[idx].ord = podOrd
+			cachedPod.name = e.PodIdentifier
+			cachedPod.ord = podOrd
 		}
 
 		a.mruName = e.PodIdentifier
@@ -1005,6 +1067,8 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			a.table.insert(podOrd, s)
 		}
 
+		slot := &a.slots[s]
+
 		// Resolve tier ordinal and tier name
 		var tierOrd uint32
 		var tier string
@@ -1013,16 +1077,16 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			tierOrd = speculativeTierOrdinal
 		} else {
 			tier = e.DeviceTier
-			if a.hasLastTier && (stringIdentical(a.lastTierName, e.DeviceTier) || a.lastTierName == e.DeviceTier) {
+			if a.hasLastTier && (*(*[2]uintptr)(unsafe.Pointer(&a.lastTierName)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.lastTierName == e.DeviceTier) {
 				tierOrd = a.lastTierOrd
 			} else {
-				if stringIdentical(a.tierCache[0].name, e.DeviceTier) || a.tierCache[0].name == e.DeviceTier {
+				if *(*[2]uintptr)(unsafe.Pointer(&a.tierCache[0].name)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.tierCache[0].name == e.DeviceTier {
 					tierOrd = a.tierCache[0].ord
-				} else if stringIdentical(a.tierCache[1].name, e.DeviceTier) || a.tierCache[1].name == e.DeviceTier {
+				} else if *(*[2]uintptr)(unsafe.Pointer(&a.tierCache[1].name)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.tierCache[1].name == e.DeviceTier {
 					tierOrd = a.tierCache[1].ord
-				} else if stringIdentical(a.tierCache[2].name, e.DeviceTier) || a.tierCache[2].name == e.DeviceTier {
+				} else if *(*[2]uintptr)(unsafe.Pointer(&a.tierCache[2].name)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.tierCache[2].name == e.DeviceTier {
 					tierOrd = a.tierCache[2].ord
-				} else if stringIdentical(a.tierCache[3].name, e.DeviceTier) || a.tierCache[3].name == e.DeviceTier {
+				} else if *(*[2]uintptr)(unsafe.Pointer(&a.tierCache[3].name)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.tierCache[3].name == e.DeviceTier {
 					tierOrd = a.tierCache[3].ord
 				} else {
 					tierOrd = a.tierOrdinal(e.DeviceTier)
@@ -1046,7 +1110,6 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		slot := &a.slots[s]
 		if tierOrd != speculativeTierOrdinal {
 			slot.confirmedSeen = a.keyStamp
 		}
@@ -1125,16 +1188,15 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		}
 
 		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
-				podName:     e.PodIdentifier,
-				tierName:    e.DeviceTier,
-				speculative: e.Speculative,
-				podOrd:      podOrd,
-				tierOrd:     tierOrd,
-				slot:        s,
-				weight:      w,
-				confirmed:   tierOrd != speculativeTierOrdinal,
-			}
+			entry := &a.posCache256[i]
+			entry.podName = e.PodIdentifier
+			entry.tierName = e.DeviceTier
+			entry.speculative = e.Speculative
+			entry.podOrd = podOrd
+			entry.tierOrd = tierOrd
+			entry.slot = s
+			entry.weight = w
+			entry.confirmed = tierOrd != speculativeTierOrdinal
 		}
 	}
 	a.weightCacheSet = weightCacheSet
@@ -1152,8 +1214,20 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
-	for i := range entries {
-		e := &entries[i]
+	var entriesPtr unsafe.Pointer
+	if len(entries) > 0 {
+		entriesPtr = unsafe.Pointer(&entries[0])
+	}
+	var slotsPtr unsafe.Pointer
+	if len(slots) > 0 {
+		slotsPtr = unsafe.Pointer(&slots[0])
+	}
+	posCache256Ptr := unsafe.Pointer(&a.posCache256[0])
+
+	nEntries := len(entries)
+
+	for i := 0; i < nEntries; i++ {
+		e := (*kvblock.PodEntry)(unsafe.Pointer(uintptr(entriesPtr) + uintptr(i)*unsafe.Sizeof(kvblock.PodEntry{})))
 
 		var s int32
 		var podOrd uint32
@@ -1162,12 +1236,12 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		var ok bool
 
 		if i < 256 {
-			entry := &a.posCache256[i]
-			if (stringIdentical(entry.podName, e.PodIdentifier) || entry.podName == e.PodIdentifier) &&
-				(stringIdentical(entry.tierName, e.DeviceTier) || entry.tierName == e.DeviceTier) &&
-				entry.speculative == e.Speculative {
+			entry := (*posCacheEntry)(unsafe.Pointer(uintptr(posCache256Ptr) + uintptr(i)*unsafe.Sizeof(posCacheEntry{})))
+			if ((*(*[2]uintptr)(unsafe.Pointer(&entry.podName)) == *(*[2]uintptr)(unsafe.Pointer(&e.PodIdentifier)) || entry.podName == e.PodIdentifier) &&
+				(*(*[2]uintptr)(unsafe.Pointer(&entry.tierName)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || entry.tierName == e.DeviceTier) &&
+				entry.speculative == e.Speculative) {
 				s := entry.slot
-				slot := &slots[s]
+				slot := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(s)*unsafe.Sizeof(matchSlot{})))
 				if slot.seen < keyStamp-1 {
 					continue
 				}
@@ -1203,29 +1277,30 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		}
 
 		if i > 0 {
-			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
-				prev.Speculative == e.Speculative {
+			prev := (*kvblock.PodEntry)(unsafe.Pointer(uintptr(entriesPtr) + uintptr(i-1)*unsafe.Sizeof(kvblock.PodEntry{})))
+			if ((*(*[2]uintptr)(unsafe.Pointer(&prev.PodIdentifier)) == *(*[2]uintptr)(unsafe.Pointer(&e.PodIdentifier)) || prev.PodIdentifier == e.PodIdentifier) &&
+				(*(*[2]uintptr)(unsafe.Pointer(&prev.DeviceTier)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || prev.DeviceTier == e.DeviceTier) &&
+				prev.Speculative == e.Speculative) {
 				continue
 			}
 		}
 
 		var found bool
-		if a.hasMru && (stringIdentical(a.mruName, e.PodIdentifier) || a.mruName == e.PodIdentifier) {
+		if a.hasMru && (*(*[2]uintptr)(unsafe.Pointer(&a.mruName)) == *(*[2]uintptr)(unsafe.Pointer(&e.PodIdentifier)) || a.mruName == e.PodIdentifier) {
 			podOrd = a.mruOrd
 			found = true
 		} else {
 			h := fastHash(e.PodIdentifier)
 			idx := h & 2047
-			if stringIdentical(a.podCache[idx].name, e.PodIdentifier) || a.podCache[idx].name == e.PodIdentifier {
-				podOrd = a.podCache[idx].ord
+			cachedPod := &a.podCache[idx]
+			if *(*[2]uintptr)(unsafe.Pointer(&cachedPod.name)) == *(*[2]uintptr)(unsafe.Pointer(&e.PodIdentifier)) || cachedPod.name == e.PodIdentifier {
+				podOrd = cachedPod.ord
 				found = true
 			} else {
 				podOrd, found = a.podsMap[e.PodIdentifier]
 				if found {
-					a.podCache[idx].name = e.PodIdentifier
-					a.podCache[idx].ord = podOrd
+					cachedPod.name = e.PodIdentifier
+					cachedPod.ord = podOrd
 				}
 			}
 			if found {
@@ -1249,16 +1324,16 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			tierOrd = speculativeTierOrdinal
 		} else {
 			tier = e.DeviceTier
-			if a.hasLastTier && (stringIdentical(a.lastTierName, e.DeviceTier) || a.lastTierName == e.DeviceTier) {
+			if a.hasLastTier && (*(*[2]uintptr)(unsafe.Pointer(&a.lastTierName)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.lastTierName == e.DeviceTier) {
 				tierOrd = a.lastTierOrd
 			} else {
-				if stringIdentical(a.tierCache[0].name, e.DeviceTier) || a.tierCache[0].name == e.DeviceTier {
+				if *(*[2]uintptr)(unsafe.Pointer(&a.tierCache[0].name)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.tierCache[0].name == e.DeviceTier {
 					tierOrd = a.tierCache[0].ord
-				} else if stringIdentical(a.tierCache[1].name, e.DeviceTier) || a.tierCache[1].name == e.DeviceTier {
+				} else if *(*[2]uintptr)(unsafe.Pointer(&a.tierCache[1].name)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.tierCache[1].name == e.DeviceTier {
 					tierOrd = a.tierCache[1].ord
-				} else if stringIdentical(a.tierCache[2].name, e.DeviceTier) || a.tierCache[2].name == e.DeviceTier {
+				} else if *(*[2]uintptr)(unsafe.Pointer(&a.tierCache[2].name)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.tierCache[2].name == e.DeviceTier {
 					tierOrd = a.tierCache[2].ord
-				} else if stringIdentical(a.tierCache[3].name, e.DeviceTier) || a.tierCache[3].name == e.DeviceTier {
+				} else if *(*[2]uintptr)(unsafe.Pointer(&a.tierCache[3].name)) == *(*[2]uintptr)(unsafe.Pointer(&e.DeviceTier)) || a.tierCache[3].name == e.DeviceTier {
 					tierOrd = a.tierCache[3].ord
 				} else {
 					tierOrd = a.tierOrdinal(e.DeviceTier)
@@ -1282,7 +1357,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		slot := &slots[s]
+		slot := (*matchSlot)(unsafe.Pointer(uintptr(slotsPtr) + uintptr(s)*unsafe.Sizeof(matchSlot{})))
 		if slot.seen < keyStamp-1 {
 			continue
 		}
@@ -1330,16 +1405,15 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		}
 
 		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
-				podName:     e.PodIdentifier,
-				tierName:    e.DeviceTier,
-				speculative: e.Speculative,
-				podOrd:      podOrd,
-				tierOrd:     tierOrd,
-				slot:        s,
-				weight:      w,
-				confirmed:   tierOrd != speculativeTierOrdinal,
-			}
+			entry := (*posCacheEntry)(unsafe.Pointer(uintptr(posCache256Ptr) + uintptr(i)*unsafe.Sizeof(posCacheEntry{})))
+			entry.podName = e.PodIdentifier
+			entry.tierName = e.DeviceTier
+			entry.speculative = e.Speculative
+			entry.podOrd = podOrd
+			entry.tierOrd = tierOrd
+			entry.slot = s
+			entry.weight = w
+			entry.confirmed = tierOrd != speculativeTierOrdinal
 		}
 	}
 	a.weightCacheSet = weightCacheSet

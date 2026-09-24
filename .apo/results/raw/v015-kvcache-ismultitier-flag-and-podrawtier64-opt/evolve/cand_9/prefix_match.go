@@ -162,6 +162,8 @@ func stringIdentical(a, b string) bool {
 }
 
 // EVOLVE-BLOCK-START
+import "unsafe"
+
 func fastHash(s string) uint32 {
 	n := len(s)
 	if n < 4 {
@@ -594,6 +596,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 				}
 			}
 			if !stamped {
+				slot.isMultiTier = true
 				slot.tiers = append(slot.tiers, tierChain{
 					ordinal: tierOrdinal,
 					name:    tier,
@@ -1115,6 +1118,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 				}
 			}
 			if !stamped {
+				slot.isMultiTier = true
 				slot.tiers = append(slot.tiers, tierChain{
 					ordinal: tierOrd,
 					name:    tier,

@@ -162,6 +162,8 @@ func stringIdentical(a, b string) bool {
 }
 
 // EVOLVE-BLOCK-START
+import "unsafe"
+
 func fastHash(s string) uint32 {
 	n := len(s)
 	if n < 4 {
@@ -175,6 +177,10 @@ func fastHash(s string) uint32 {
 		return h
 	}
 	return uint32(s[0])*50625 + uint32(s[n/2])*1351 + uint32(s[n-2])*31 + uint32(s[n-1])
+}
+
+func stringIdentical(a, b string) bool {
+	return *(*[2]uintptr)(unsafe.Pointer(&a)) == *(*[2]uintptr)(unsafe.Pointer(&b))
 }
 
 func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
@@ -467,6 +473,10 @@ func releaseAccumulator(a *prefixAccumulator) {
 	a.weights, a.filter = nil, nil
 	for i := 0; i < len(a.slots); i++ {
 		a.slots[i].pod = ""
+		a.slots[i].tier0Name = ""
+		for j := range a.slots[i].tiers {
+			a.slots[i].tiers[j].name = ""
+		}
 	}
 	accumulatorPool.Put(a)
 }
@@ -656,9 +666,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				}
 				// stampTier inline
 				if !slot.isMultiTier {
-					if slot.tier0Ordinal == entry.tierOrd {
-						slot.tier0Seen = keyStamp
-					}
+					slot.tier0Seen = keyStamp
 				} else {
 					if slot.tiers[0].ordinal == entry.tierOrd {
 						slot.tiers[0].seen = keyStamp

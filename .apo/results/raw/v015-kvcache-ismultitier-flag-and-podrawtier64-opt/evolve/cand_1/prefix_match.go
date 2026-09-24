@@ -162,6 +162,8 @@ func stringIdentical(a, b string) bool {
 }
 
 // EVOLVE-BLOCK-START
+import "unsafe"
+
 func fastHash(s string) uint32 {
 	n := len(s)
 	if n < 4 {
@@ -560,7 +562,6 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 					stamped = true
 				} else {
 					// Fallback to multi-tier
-					slot.isMultiTier = true
 					slot.tiers = append(slot.tiers, tierChain{
 						ordinal: slot.tier0Ordinal,
 						name:    slot.tier0Name,
@@ -574,6 +575,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 						seen:    a.keyStamp,
 						alive:   true,
 					})
+					slot.isMultiTier = true
 					stamped = true
 				}
 			} else {
@@ -600,6 +602,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 					seen:    a.keyStamp,
 					alive:   true,
 				})
+				slot.isMultiTier = true
 			}
 		}
 
@@ -1081,7 +1084,6 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 					stamped = true
 				} else {
 					// Fallback to multi-tier
-					slot.isMultiTier = true
 					slot.tiers = append(slot.tiers, tierChain{
 						ordinal: slot.tier0Ordinal,
 						name:    slot.tier0Name,
@@ -1095,6 +1097,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 						seen:    a.keyStamp,
 						alive:   true,
 					})
+					slot.isMultiTier = true
 					stamped = true
 				}
 			} else {
@@ -1121,6 +1124,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 					seen:    a.keyStamp,
 					alive:   true,
 				})
+				slot.isMultiTier = true
 			}
 		}
 

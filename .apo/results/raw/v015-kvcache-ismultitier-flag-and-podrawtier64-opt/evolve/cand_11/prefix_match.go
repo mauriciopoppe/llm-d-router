@@ -162,6 +162,8 @@ func stringIdentical(a, b string) bool {
 }
 
 // EVOLVE-BLOCK-START
+import "unsafe"
+
 func fastHash(s string) uint32 {
 	n := len(s)
 	if n < 4 {
@@ -314,7 +316,7 @@ type matchSlot struct {
 	pod       string
 	tier0Name string
 	tiers     []tierChain
-	_         [7]byte // Padding to align to exactly 128 bytes
+	_         [8]byte // Padding to align to exactly 128 bytes
 }
 
 type posCacheEntry struct {
@@ -553,7 +555,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 
 		// stampTier inline in keyFirst
 		stamped := false
-		if !slot.isMultiTier {
+		if len(slot.tiers) == 0 {
 			if slot.hasTier0 {
 				if slot.tier0Ordinal == tierOrdinal {
 					slot.tier0Seen = a.keyStamp
@@ -926,7 +928,7 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 	for i := range a.slots {
 		s := &a.slots[i]
 		var byTier map[string]int
-		if !s.isMultiTier {
+		if len(s.tiers) == 0 {
 			if s.hasTier0 {
 				if (stringIdentical(s.tier0Name, a.lastSingularName) || s.tier0Name == a.lastSingularName) && s.tier0Count == a.lastSingularCount {
 					byTier = a.lastSingularMap
@@ -1074,7 +1076,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 
 		// stampTier inline in keyPodsFirst
 		stamped := false
-		if !slot.isMultiTier {
+		if len(slot.tiers) == 0 {
 			if slot.hasTier0 {
 				if slot.tier0Ordinal == tierOrd {
 					slot.tier0Seen = a.keyStamp
