@@ -155,6 +155,7 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 	return matchMaterialized(ctx, keys, keyToPods, weights, filter)
 }
 
+// EVOLVE-BLOCK-START
 // matchMaterialized feeds the accumulator from a Lookup result, walking keys
 // in order and stopping at the first key without entries. Pod and tier
 // ordinals are assigned per call, since materialized entries carry none.
@@ -403,11 +404,12 @@ func (a *prefixAccumulator) tierOrdinal(name string) uint32 {
 	return id
 }
 
+// EVOLVE-BLOCK-END
+
 // speculativeTierOrdinal keys the speculative per-tier chain. Feeders assign
 // tier ordinals from zero, so the top of the range never collides.
 const speculativeTierOrdinal = math.MaxUint32
 
-// EVOLVE-BLOCK-START
 // slotTable is an open-addressed map from pod ordinal to request-local slot.
 // It is sized by the first key's entry count, so request state scales with
 // the live candidates rather than with every ordinal an index ever assigned.
@@ -939,4 +941,3 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 	return w
 }
 
-// EVOLVE-BLOCK-END
