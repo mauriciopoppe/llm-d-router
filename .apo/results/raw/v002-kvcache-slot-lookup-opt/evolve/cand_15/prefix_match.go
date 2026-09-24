@@ -204,13 +204,17 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 const speculativeTierOrdinal = math.MaxUint32
 
 // EVOLVE-BLOCK-START
+// slotRef maps one pod ordinal to a request-local slot.
+type slotRef struct {
+	ordinal uint32
+	slot    uint32 // slot index plus one; zero marks an empty bucket
+}
+
 // slotTable is an open-addressed map from pod ordinal to request-local slot.
 // It is sized by the first key's entry count, so request state scales with
 // the live candidates rather than with every ordinal an index ever assigned.
-// It packs (ordinal << 32) | (slot_index + 1) into a single uint64 bucket
-// to minimize cache lines and avoid struct/alignment overhead.
 type slotTable struct {
-	buckets []uint64
+	buckets []slotRef
 }
 
 func (t *slotTable) reset(numEntries int) {
@@ -219,7 +223,7 @@ func (t *slotTable) reset(numEntries int) {
 		size <<= 1
 	}
 	if cap(t.buckets) < size {
-		t.buckets = make([]uint64, size)
+		t.buckets = make([]slotRef, size)
 		return
 	}
 	t.buckets = t.buckets[:size]
@@ -228,32 +232,41 @@ func (t *slotTable) reset(numEntries int) {
 
 func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 	buckets := t.buckets
-	if len(buckets) == 0 {
+	n := len(buckets)
+	if n == 0 {
 		return 0, false
 	}
-	mask := uint32(len(buckets) - 1)
-	i := ordinal * 2654435761 & mask
+	mask := uint32(n - 1)
+	_ = buckets[mask]
+	idx := (ordinal * 2654435761) & mask
 	for {
-		b := buckets[i]
-		slot := uint32(b)
-		if slot == 0 {
+		b := buckets[idx]
+		if b.slot == 0 {
 			return 0, false
 		}
-		if uint32(b>>32) == ordinal {
-			return int32(slot - 1), true
+		if b.ordinal == ordinal {
+			return int32(b.slot - 1), true
 		}
-		i = (i + 1) & mask
+		idx = (idx + 1) & mask
 	}
 }
 
 func (t *slotTable) insert(ordinal uint32, slot int32) {
 	buckets := t.buckets
-	mask := uint32(len(buckets) - 1)
-	i := ordinal * 2654435761 & mask
-	for uint32(buckets[i]) != 0 {
-		i = (i + 1) & mask
+	n := len(buckets)
+	if n == 0 {
+		return
 	}
-	buckets[i] = (uint64(ordinal) << 32) | uint64(slot+1)
+	mask := uint32(n - 1)
+	_ = buckets[mask]
+	idx := (ordinal * 2654435761) & mask
+	for {
+		if buckets[idx].slot == 0 {
+			buckets[idx] = slotRef{ordinal: ordinal, slot: uint32(slot) + 1}
+			return
+		}
+		idx = (idx + 1) & mask
+	}
 }
 
 // tierChain tracks one tier's contiguous prefix for a candidate pod.
@@ -316,6 +329,8 @@ type prefixAccumulator struct {
 	podsMap  map[string]uint32
 	tiersMap map[string]uint32
 	refsBuf  []kvblock.EntryRef
+
+	activeFilter [8]uint64
 }
 
 var accumulatorPool = sync.Pool{New: func() any {
@@ -324,7 +339,7 @@ var accumulatorPool = sync.Pool{New: func() any {
 		slots[i].tiers = make([]tierChain, 0, 4)
 	}
 	return &prefixAccumulator{
-		table:       slotTable{buckets: make([]uint64, 512)},
+		table:       slotTable{buckets: make([]slotRef, 512)},
 		slots:       slots[:0],
 		active:      make([]int32, 0, 256),
 		weightCache: make([]tierWeight, 0, 8),
@@ -334,6 +349,16 @@ var accumulatorPool = sync.Pool{New: func() any {
 	}
 }}
 
+func (a *prefixAccumulator) addToFilter(ordinal uint32) {
+	h := (ordinal * 2654435761) & 511
+	a.activeFilter[h>>6] |= (uint64(1) << (h & 63))
+}
+
+func (a *prefixAccumulator) testFilter(ordinal uint32) bool {
+	h := (ordinal * 2654435761) & 511
+	return (a.activeFilter[h>>6] & (uint64(1) << (h & 63))) != 0
+}
+
 func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *prefixAccumulator {
 	a := accumulatorPool.Get().(*prefixAccumulator)
 	a.weights, a.filter = weights, filter
@@ -342,6 +367,7 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	a.keyStamp = 0
 	a.first = true
 	a.weightCache = a.weightCache[:0]
+	a.activeFilter = [8]uint64{}
 	if a.podsMap == nil {
 		a.podsMap = make(map[string]uint32, 128)
 	} else {
@@ -365,94 +391,95 @@ func releaseAccumulator(a *prefixAccumulator) {
 	accumulatorPool.Put(a)
 }
 
-// keyFirst is the cold path for folding the very first key's entries.
-func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
-	a.table.reset(len(entries))
-	var prev *kvblock.EntryRef
-	for i := range entries {
-		ref := &entries[i]
-		if prev != nil && ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
-			ref.Speculative == prev.Speculative {
-			continue
-		}
-		prev = ref
-
-		s, ok := a.table.lookup(ref.PodOrdinal)
-		if !ok {
-			if a.filter.Len() > 0 && !a.filter.Has(ref.PodIdentifier) {
-				continue
-			}
-			s = a.newSlot(ref.PodIdentifier)
-			a.table.insert(ref.PodOrdinal, s)
-		}
-		slot := &a.slots[s]
-
-		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
-		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
-			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
-		} else {
-			slot.confirmedSeen = a.keyStamp
-		}
-
-		w := a.weightOf(tier, tierOrdinal)
-		if slot.seen != a.keyStamp {
-			slot.seen = a.keyStamp
-			slot.weight = w
-		} else if w > slot.weight {
-			slot.weight = w
-		}
-
-		if !a.stampTier(slot, tierOrdinal) {
-			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
-		}
-	}
-	return a.endKey()
-}
-
 // key folds one key's entries into the chains and reports whether any chain
 // is still alive. entries is borrowed for the duration of the call.
 func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	a.keyStamp++
 	if a.first {
-		return a.keyFirst(entries)
-	}
+		a.table.reset(len(entries))
+		var prev *kvblock.EntryRef
+		for i := range entries {
+			ref := &entries[i]
+			if prev != nil && ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
+				ref.Speculative == prev.Speculative {
+				continue
+			}
+			prev = ref
 
-	var prev *kvblock.EntryRef
-	for i := range entries {
-		ref := &entries[i]
-		// Another rank of an endpoint just folded at this key adds nothing
-		// to its chains.
-		if prev != nil && ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
-			ref.Speculative == prev.Speculative {
-			continue
-		}
-		prev = ref
+			s, ok := a.table.lookup(ref.PodOrdinal)
+			if !ok {
+				if a.filter.Len() > 0 && !a.filter.Has(ref.PodIdentifier) {
+					continue
+				}
+				s = a.newSlot(ref.PodIdentifier)
+				a.table.insert(ref.PodOrdinal, s)
+				a.addToFilter(ref.PodOrdinal)
+			}
+			slot := &a.slots[s]
 
-		s, ok := a.table.lookup(ref.PodOrdinal)
-		if !ok {
-			continue // the first key fixes the candidate set
-		}
-		slot := &a.slots[s]
-		if slot.seen < a.keyStamp-1 {
-			continue // entries for dead slots should be pruned early
-		}
+			tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
+			if ref.Speculative || ref.DeviceTier == SpeculativeTier {
+				tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
+			} else {
+				slot.confirmedSeen = a.keyStamp
+			}
 
-		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
-		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
-			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
-		} else {
-			slot.confirmedSeen = a.keyStamp
-		}
+			w := a.weightOf(tier, tierOrdinal)
+			if slot.seen != a.keyStamp {
+				slot.seen = a.keyStamp
+				slot.weight = w
+			} else if w > slot.weight {
+				slot.weight = w
+			}
 
-		w := a.weightOf(tier, tierOrdinal)
-		if slot.seen != a.keyStamp {
-			slot.seen = a.keyStamp
-			slot.weight = w
-		} else if w > slot.weight {
-			slot.weight = w
+			if !a.stampTier(slot, tierOrdinal) {
+				slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
+			}
 		}
+	} else {
+		slots := a.slots
+		var prev *kvblock.EntryRef
+		for i := range entries {
+			ref := &entries[i]
+			if prev != nil && ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
+				ref.Speculative == prev.Speculative {
+				continue
+			}
+			prev = ref
 
-		_ = a.stampTier(slot, tierOrdinal)
+			if !a.testFilter(ref.PodOrdinal) {
+				continue
+			}
+
+			s, ok := a.table.lookup(ref.PodOrdinal)
+			if !ok {
+				continue
+			}
+			if uint(s) >= uint(len(slots)) {
+				continue
+			}
+			slot := &slots[s]
+			if slot.seen < a.keyStamp-1 {
+				continue
+			}
+
+			tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
+			if ref.Speculative || ref.DeviceTier == SpeculativeTier {
+				tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
+			} else {
+				slot.confirmedSeen = a.keyStamp
+			}
+
+			w := a.weightOf(tier, tierOrdinal)
+			if slot.seen != a.keyStamp {
+				slot.seen = a.keyStamp
+				slot.weight = w
+			} else if w > slot.weight {
+				slot.weight = w
+			}
+
+			a.stampTier(slot, tierOrdinal)
+		}
 	}
 	return a.endKey()
 }
@@ -461,7 +488,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 // slot tracks that tier.
 func (a *prefixAccumulator) stampTier(slot *matchSlot, tierOrdinal uint32) bool {
 	tiers := slot.tiers
-	for i := range tiers {
+	for i := 0; i < len(tiers); i++ {
 		if tiers[i].ordinal == tierOrdinal {
 			tiers[i].seen = a.keyStamp
 			return true
@@ -475,14 +502,17 @@ func (a *prefixAccumulator) stampTier(slot *matchSlot, tierOrdinal uint32) bool 
 func (a *prefixAccumulator) endKey() bool {
 	if a.first {
 		a.first = false
-		for i := range a.slots {
-			s := &a.slots[i]
-			s.matched, s.score = 1, s.weight
+		slots := a.slots
+		for i := 0; i < len(slots); i++ {
+			s := &slots[i]
+			s.matched = 1
+			s.score = s.weight
 			if s.confirmedSeen == a.keyStamp {
-				s.confirmed, s.confirmedAlive = 1, true
+				s.confirmed = 1
+				s.confirmedAlive = true
 			}
 			tiers := s.tiers
-			for t := range tiers {
+			for t := 0; t < len(tiers); t++ {
 				tiers[t].count = 1
 			}
 			a.active = append(a.active, int32(i))
@@ -491,10 +521,15 @@ func (a *prefixAccumulator) endKey() bool {
 	}
 
 	keep := a.active[:0]
-	for _, i := range a.active {
-		s := &a.slots[i]
+	active := a.active
+	slots := a.slots
+	for _, i := range active {
+		if uint(i) >= uint(len(slots)) {
+			continue
+		}
+		s := &slots[i]
 		if s.seen != a.keyStamp {
-			continue // the chain ends at the first key the pod does not hold
+			continue
 		}
 		s.matched++
 		s.score += s.weight
@@ -506,7 +541,7 @@ func (a *prefixAccumulator) endKey() bool {
 			}
 		}
 		tiers := s.tiers
-		for t := range tiers {
+		for t := 0; t < len(tiers); t++ {
 			tc := &tiers[t]
 			if tc.alive {
 				if tc.seen == a.keyStamp {

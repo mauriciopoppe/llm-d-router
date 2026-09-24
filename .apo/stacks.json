@@ -1,0 +1,12 @@
+{
+  "stacks": [
+    {
+      "id": "local-cpu-standard",
+      "host": "localhost",
+      "cpu_cores": 16,
+      "memory_mb": 16384,
+      "environment": "local",
+      "status": "IDLE"
+    }
+  ]
+}

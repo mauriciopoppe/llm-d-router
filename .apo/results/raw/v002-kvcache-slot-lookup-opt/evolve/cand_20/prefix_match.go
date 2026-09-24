@@ -204,13 +204,16 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 const speculativeTierOrdinal = math.MaxUint32
 
 // EVOLVE-BLOCK-START
+type bucket struct {
+	ordinal uint32
+	slot    uint32
+}
+
 // slotTable is an open-addressed map from pod ordinal to request-local slot.
 // It is sized by the first key's entry count, so request state scales with
 // the live candidates rather than with every ordinal an index ever assigned.
-// It packs (ordinal << 32) | (slot_index + 1) into a single uint64 bucket
-// to minimize cache lines and avoid struct/alignment overhead.
 type slotTable struct {
-	buckets []uint64
+	buckets []bucket
 }
 
 func (t *slotTable) reset(numEntries int) {
@@ -219,7 +222,7 @@ func (t *slotTable) reset(numEntries int) {
 		size <<= 1
 	}
 	if cap(t.buckets) < size {
-		t.buckets = make([]uint64, size)
+		t.buckets = make([]bucket, size)
 		return
 	}
 	t.buckets = t.buckets[:size]
@@ -228,19 +231,19 @@ func (t *slotTable) reset(numEntries int) {
 
 func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 	buckets := t.buckets
-	if len(buckets) == 0 {
+	n := len(buckets)
+	if n == 0 {
 		return 0, false
 	}
-	mask := uint32(len(buckets) - 1)
+	mask := uint32(n - 1)
 	i := ordinal * 2654435761 & mask
 	for {
 		b := buckets[i]
-		slot := uint32(b)
-		if slot == 0 {
+		if b.slot == 0 {
 			return 0, false
 		}
-		if uint32(b>>32) == ordinal {
-			return int32(slot - 1), true
+		if b.ordinal == ordinal {
+			return int32(b.slot - 1), true
 		}
 		i = (i + 1) & mask
 	}
@@ -250,10 +253,34 @@ func (t *slotTable) insert(ordinal uint32, slot int32) {
 	buckets := t.buckets
 	mask := uint32(len(buckets) - 1)
 	i := ordinal * 2654435761 & mask
-	for uint32(buckets[i]) != 0 {
+	for buckets[i].slot != 0 {
 		i = (i + 1) & mask
 	}
-	buckets[i] = (uint64(ordinal) << 32) | uint64(slot+1)
+	buckets[i] = bucket{ordinal: ordinal, slot: uint32(slot + 1)}
+}
+
+func (t *slotTable) rebuild(slots []matchSlot, active []int32) {
+	numEntries := len(active)
+	size := 2
+	for size < numEntries*2 {
+		size <<= 1
+	}
+	if cap(t.buckets) < size {
+		t.buckets = make([]bucket, size)
+	} else {
+		t.buckets = t.buckets[:size]
+		clear(t.buckets)
+	}
+	mask := uint32(size - 1)
+	for _, s := range active {
+		slot := &slots[s]
+		ordinal := slot.ordinal
+		i := ordinal * 2654435761 & mask
+		for t.buckets[i].slot != 0 {
+			i = (i + 1) & mask
+		}
+		t.buckets[i] = bucket{ordinal: ordinal, slot: uint32(s + 1)}
+	}
 }
 
 // tierChain tracks one tier's contiguous prefix for a candidate pod.
@@ -275,6 +302,7 @@ type tierWeight struct {
 // matchSlot is one candidate pod's accumulated state.
 type matchSlot struct {
 	pod     string
+	ordinal uint32
 	matched int
 	score   float64
 	// seen is the key stamp of the last key holding this pod; weight is the
@@ -324,7 +352,7 @@ var accumulatorPool = sync.Pool{New: func() any {
 		slots[i].tiers = make([]tierChain, 0, 4)
 	}
 	return &prefixAccumulator{
-		table:       slotTable{buckets: make([]uint64, 512)},
+		table:       slotTable{buckets: make([]bucket, 512)},
 		slots:       slots[:0],
 		active:      make([]int32, 0, 256),
 		weightCache: make([]tierWeight, 0, 8),
@@ -369,6 +397,8 @@ func releaseAccumulator(a *prefixAccumulator) {
 func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	a.table.reset(len(entries))
 	var prev *kvblock.EntryRef
+	var lastOrdinal uint32 = 0xffffffff
+	var lastSlot *matchSlot = nil
 	for i := range entries {
 		ref := &entries[i]
 		if prev != nil && ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
@@ -377,15 +407,27 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 		}
 		prev = ref
 
-		s, ok := a.table.lookup(ref.PodOrdinal)
-		if !ok {
-			if a.filter.Len() > 0 && !a.filter.Has(ref.PodIdentifier) {
-				continue
+		var slot *matchSlot
+		if ref.PodOrdinal == lastOrdinal {
+			slot = lastSlot
+		} else {
+			lastOrdinal = ref.PodOrdinal
+			s, ok := a.table.lookup(ref.PodOrdinal)
+			if !ok {
+				if a.filter.Len() > 0 && !a.filter.Has(ref.PodIdentifier) {
+					lastSlot = nil
+					continue
+				}
+				s = a.newSlot(ref.PodIdentifier)
+				a.slots[s].ordinal = ref.PodOrdinal
+				a.table.insert(ref.PodOrdinal, s)
 			}
-			s = a.newSlot(ref.PodIdentifier)
-			a.table.insert(ref.PodOrdinal, s)
+			slot = &a.slots[s]
+			lastSlot = slot
 		}
-		slot := &a.slots[s]
+		if slot == nil {
+			continue
+		}
 
 		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
 		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
@@ -418,6 +460,8 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	}
 
 	var prev *kvblock.EntryRef
+	var lastOrdinal uint32 = 0xffffffff
+	var lastSlot *matchSlot = nil
 	for i := range entries {
 		ref := &entries[i]
 		// Another rank of an endpoint just folded at this key adds nothing
@@ -428,13 +472,21 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		}
 		prev = ref
 
-		s, ok := a.table.lookup(ref.PodOrdinal)
-		if !ok {
-			continue // the first key fixes the candidate set
+		var slot *matchSlot
+		if ref.PodOrdinal == lastOrdinal {
+			slot = lastSlot
+		} else {
+			lastOrdinal = ref.PodOrdinal
+			s, ok := a.table.lookup(ref.PodOrdinal)
+			if !ok {
+				lastSlot = nil
+				continue // the first key fixes the candidate set (or pruned active set)
+			}
+			slot = &a.slots[s]
+			lastSlot = slot
 		}
-		slot := &a.slots[s]
-		if slot.seen < a.keyStamp-1 {
-			continue // entries for dead slots should be pruned early
+		if slot == nil {
+			continue
 		}
 
 		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
@@ -461,10 +513,31 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 // slot tracks that tier.
 func (a *prefixAccumulator) stampTier(slot *matchSlot, tierOrdinal uint32) bool {
 	tiers := slot.tiers
-	for i := range tiers {
-		if tiers[i].ordinal == tierOrdinal {
-			tiers[i].seen = a.keyStamp
+	n := len(tiers)
+	if n == 0 {
+		return false
+	}
+	_ = tiers[0]
+	if tiers[0].ordinal == tierOrdinal {
+		tiers[0].seen = a.keyStamp
+		return true
+	}
+	if n > 1 {
+		if tiers[1].ordinal == tierOrdinal {
+			tiers[1].seen = a.keyStamp
 			return true
+		}
+		if n > 2 {
+			if tiers[2].ordinal == tierOrdinal {
+				tiers[2].seen = a.keyStamp
+				return true
+			}
+			for i := 3; i < n; i++ {
+				if tiers[i].ordinal == tierOrdinal {
+					tiers[i].seen = a.keyStamp
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -490,6 +563,7 @@ func (a *prefixAccumulator) endKey() bool {
 		return len(a.active) > 0
 	}
 
+	origLen := len(a.active)
 	keep := a.active[:0]
 	for _, i := range a.active {
 		s := &a.slots[i]
@@ -506,8 +580,10 @@ func (a *prefixAccumulator) endKey() bool {
 			}
 		}
 		tiers := s.tiers
-		for t := range tiers {
-			tc := &tiers[t]
+		n := len(tiers)
+		if n > 0 {
+			_ = tiers[0]
+			tc := &tiers[0]
 			if tc.alive {
 				if tc.seen == a.keyStamp {
 					tc.count++
@@ -515,10 +591,45 @@ func (a *prefixAccumulator) endKey() bool {
 					tc.alive = false
 				}
 			}
+			if n > 1 {
+				tc = &tiers[1]
+				if tc.alive {
+					if tc.seen == a.keyStamp {
+						tc.count++
+					} else {
+						tc.alive = false
+					}
+				}
+				if n > 2 {
+					tc = &tiers[2]
+					if tc.alive {
+						if tc.seen == a.keyStamp {
+							tc.count++
+						} else {
+							tc.alive = false
+						}
+					}
+					for t := 3; t < n; t++ {
+						tc = &tiers[t]
+						if tc.alive {
+							if tc.seen == a.keyStamp {
+								tc.count++
+							} else {
+								tc.alive = false
+							}
+						}
+					}
+				}
+			}
 		}
 		keep = append(keep, i)
 	}
-	a.active = keep
+	if len(keep) < origLen {
+		a.active = keep
+		a.table.rebuild(a.slots, a.active)
+	} else {
+		a.active = keep
+	}
 	return len(a.active) > 0
 }
 // EVOLVE-BLOCK-END
