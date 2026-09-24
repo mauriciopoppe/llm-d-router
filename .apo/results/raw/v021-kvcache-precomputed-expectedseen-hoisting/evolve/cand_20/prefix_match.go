@@ -1241,7 +1241,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
-					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
+					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
 				} else {
 					if entry.confirmed {
 						slot.confirmedSeen = keyStamp

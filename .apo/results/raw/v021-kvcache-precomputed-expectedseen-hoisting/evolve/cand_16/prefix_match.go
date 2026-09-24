@@ -174,7 +174,7 @@ func fastHash(s string) uint32 {
 		}
 		return h
 	}
-	return uint32(s[0])*50625 + uint32(s[n/2])*1351 + uint32(s[n-2])*31 + uint32(s[n-1])
+	return uint32(s[0])*50625 + uint32(s[n>>1])*1351 + uint32(s[n-2])*31 + uint32(s[n-1])
 }
 
 func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
@@ -255,6 +255,7 @@ func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 	}
 	mask := uint32(len(buckets) - 1)
 	i := (ordinal * 2654435761) & mask
+	_ = buckets[mask]
 	for {
 		b := buckets[i]
 		if b == 0 {
@@ -271,6 +272,7 @@ func (t *slotTable) insert(ordinal uint32, slot int32) {
 	buckets := t.buckets
 	mask := uint32(len(buckets) - 1)
 	i := (ordinal * 2654435761) & mask
+	_ = buckets[mask]
 	for buckets[i] != 0 {
 		i = (i + 1) & mask
 	}
@@ -831,6 +833,10 @@ func (a *prefixAccumulator) endKey() bool {
 	idx := 0
 
 	if len(active) == len(slots) {
+		if n > 0 {
+			_ = slots[n-1]
+			_ = active[n-1]
+		}
 		for ; idx < n; idx++ {
 			s := &slots[idx]
 			if s.seen != keyStamp {
@@ -1198,6 +1204,7 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			}
 		}
 	}
+	a.mru = mru
 	a.weightCacheSet = weightCacheSet
 	return a.endKey()
 }
@@ -1211,6 +1218,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	slots := a.slots
 	keyStamp := a.keyStamp
 	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
+	mru := a.mru
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
@@ -1305,7 +1313,16 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			continue
 		}
 
-		s, ok = a.table.lookup(podOrd)
+		if uint32(mru>>32) == podOrd {
+			s = int32(mru)
+			ok = true
+		} else {
+			s, ok = a.table.lookup(podOrd)
+			if ok {
+				mru = (uint64(podOrd) << 32) | uint64(uint32(s))
+			}
+		}
+
 		if !ok {
 			continue
 		}

@@ -633,7 +633,8 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	posCache := a.posCache
 	slots := a.slots
 	keyStamp := a.keyStamp
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
+	var expectedSeen uint64
+	var expectedSeenComputed bool
 	mru := a.mru
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
@@ -657,6 +658,10 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
+					if !expectedSeenComputed {
+						expectedSeen = (uint64(keyStamp) << 32) | uint64(keyStamp)
+						expectedSeenComputed = true
+					}
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
 				} else {
 					if entry.confirmed {
@@ -668,14 +673,11 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 							slot.tier0Seen = keyStamp
 						}
 					} else {
-						if slot.tiers[0].ordinal == entry.tierOrd {
-							slot.tiers[0].seen = keyStamp
-						} else {
-							for t := 1; t < len(slot.tiers); t++ {
-								if slot.tiers[t].ordinal == entry.tierOrd {
-									slot.tiers[t].seen = keyStamp
-									break
-								}
+						tiers := slot.tiers
+						for t := range tiers {
+							if tiers[t].ordinal == entry.tierOrd {
+								tiers[t].seen = keyStamp
+								break
 							}
 						}
 					}
@@ -762,14 +764,11 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				slot.tier0Seen = keyStamp
 			}
 		} else {
-			if slot.tiers[0].ordinal == tierOrdinal {
-				slot.tiers[0].seen = keyStamp
-			} else {
-				for t := 1; t < len(slot.tiers); t++ {
-					if slot.tiers[t].ordinal == tierOrdinal {
-						slot.tiers[t].seen = keyStamp
-						break
-					}
+			tiers := slot.tiers
+			for t := range tiers {
+				if tiers[t].ordinal == tierOrdinal {
+					tiers[t].seen = keyStamp
+					break
 				}
 			}
 		}
@@ -1210,7 +1209,8 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 
 	slots := a.slots
 	keyStamp := a.keyStamp
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
+	var expectedSeen uint64
+	var expectedSeenComputed bool
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
@@ -1241,6 +1241,10 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
+					if !expectedSeenComputed {
+						expectedSeen = (uint64(keyStamp) << 32) | uint64(keyStamp)
+						expectedSeenComputed = true
+					}
 					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
 				} else {
 					if entry.confirmed {
@@ -1252,14 +1256,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 							slot.tier0Seen = keyStamp
 						}
 					} else {
-						if slot.tiers[0].ordinal == entry.tierOrd {
-							slot.tiers[0].seen = keyStamp
-						} else {
-							for t := 1; t < len(slot.tiers); t++ {
-								if slot.tiers[t].ordinal == entry.tierOrd {
-									slot.tiers[t].seen = keyStamp
-									break
-								}
+						tiers := slot.tiers
+						for t := range tiers {
+							if tiers[t].ordinal == entry.tierOrd {
+								tiers[t].seen = keyStamp
+								break
 							}
 						}
 					}
@@ -1383,14 +1384,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				slot.tier0Seen = keyStamp
 			}
 		} else {
-			if slot.tiers[0].ordinal == tierOrd {
-				slot.tiers[0].seen = keyStamp
-			} else {
-				for t := 1; t < len(slot.tiers); t++ {
-					if slot.tiers[t].ordinal == tierOrd {
-						slot.tiers[t].seen = keyStamp
-						break
-					}
+			tiers := slot.tiers
+			for t := range tiers {
+				if tiers[t].ordinal == tierOrd {
+					tiers[t].seen = keyStamp
+					break
 				}
 			}
 		}

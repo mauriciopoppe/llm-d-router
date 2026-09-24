@@ -318,15 +318,16 @@ type matchSlot struct {
 }
 
 type posCacheEntry struct {
-	podName       string
-	tierName      string
-	speculative   bool
-	podOrd        uint32
-	tierOrd       uint32
-	slot          int32
-	weight        float64
-	confirmed     bool
-	isSingleTier0 bool
+	podName       string  // 16 bytes
+	tierName      string  // 16 bytes
+	weight        float64 // 8 bytes
+	podOrd        uint32  // 4 bytes
+	tierOrd       uint32  // 4 bytes
+	slot          int32   // 4 bytes
+	speculative   bool    // 1 byte
+	confirmed     bool    // 1 byte
+	isSingleTier0 bool    // 1 byte
+	_             [9]byte // Pad to exactly 64 bytes (Cache Line sized)
 }
 
 type posCacheEntryKey struct {
@@ -366,6 +367,7 @@ type prefixAccumulator struct {
 	hasFilter bool
 
 	table    slotTable
+	slotsBuf []byte
 	slots    []matchSlot
 	active   []int32
 	keyStamp uint32
@@ -379,6 +381,7 @@ type prefixAccumulator struct {
 	tiersMap map[string]uint32
 	refsBuf  []kvblock.EntryRef
 
+	posCacheBuf          []byte
 	posCache             []posCacheEntryKey
 	mru                  uint64
 	weightCacheDirect    [64]float64
@@ -406,12 +409,16 @@ type prefixAccumulator struct {
 }
 
 var accumulatorPool = sync.Pool{New: func() any {
-	slots := make([]matchSlot, 256)
+	slotsBuf := make([]byte, 256*128+127)
+	ptr := uintptr(unsafe.Pointer(&slotsBuf[0]))
+	alignedPtr := (ptr + 127) &^ 127
+	slots := unsafe.Slice((*matchSlot)(unsafe.Pointer(alignedPtr)), 256)
 	for i := range slots {
 		slots[i].tiers = make([]tierChain, 0, 4)
 	}
 	return &prefixAccumulator{
 		table:         slotTable{buckets: make([]uint64, 512)},
+		slotsBuf:      slotsBuf,
 		slots:         slots[:0],
 		active:        make([]int32, 0, 256),
 		weightCache:   make([]tierWeight, 0, 8),
@@ -478,7 +485,11 @@ func releaseAccumulator(a *prefixAccumulator) {
 func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	a.table.reset(len(entries))
 	if cap(a.posCache) < len(entries) {
-		a.posCache = make([]posCacheEntryKey, len(entries))
+		reqBytes := 32 * len(entries)
+		a.posCacheBuf = make([]byte, reqBytes+31)
+		ptr := uintptr(unsafe.Pointer(&a.posCacheBuf[0]))
+		alignedPtr := (ptr + 31) &^ 31
+		a.posCache = unsafe.Slice((*posCacheEntryKey)(unsafe.Pointer(alignedPtr)), len(entries))
 	} else {
 		a.posCache = a.posCache[:len(entries)]
 	}
@@ -1437,10 +1448,37 @@ func (a *prefixAccumulator) newSlot(pod string) int32 {
 		s.tier0Alive = false
 		s.tier0Name = ""
 	} else {
-		a.slots = append(a.slots, matchSlot{
-			pod:   pod,
-			tiers: make([]tierChain, 0, 4),
-		})
+		newCap := cap(a.slots) * 2
+		if newCap == 0 {
+			newCap = 256
+		}
+		newBuf := make([]byte, newCap*128+127)
+		ptr := uintptr(unsafe.Pointer(&newBuf[0]))
+		alignedPtr := (ptr + 127) &^ 127
+		newSlots := unsafe.Slice((*matchSlot)(unsafe.Pointer(alignedPtr)), newCap)
+		copy(newSlots, a.slots)
+		for i := len(a.slots); i < newCap; i++ {
+			newSlots[i].tiers = make([]tierChain, 0, 4)
+		}
+		a.slotsBuf = newBuf
+		a.slots = newSlots[:n+1]
+		s := &a.slots[n]
+		s.pod = pod
+		s.matched = 0
+		s.score = 0
+		s.seen = 0
+		s.weight = 0
+		s.tiers = s.tiers[:0]
+		s.confirmed = 0
+		s.confirmedSeen = 0
+		s.confirmedAlive = false
+		s.hasTier0 = false
+		s.isMultiTier = false
+		s.tier0Ordinal = 0
+		s.tier0Seen = 0
+		s.tier0Count = 0
+		s.tier0Alive = false
+		s.tier0Name = ""
 	}
 	return int32(n)
 }

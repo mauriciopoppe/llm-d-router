@@ -668,14 +668,11 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 							slot.tier0Seen = keyStamp
 						}
 					} else {
-						if slot.tiers[0].ordinal == entry.tierOrd {
-							slot.tiers[0].seen = keyStamp
-						} else {
-							for t := 1; t < len(slot.tiers); t++ {
-								if slot.tiers[t].ordinal == entry.tierOrd {
-									slot.tiers[t].seen = keyStamp
-									break
-								}
+						tiers := slot.tiers
+						for t := range tiers {
+							if tiers[t].ordinal == entry.tierOrd {
+								tiers[t].seen = keyStamp
+								break
 							}
 						}
 					}
@@ -762,14 +759,11 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				slot.tier0Seen = keyStamp
 			}
 		} else {
-			if slot.tiers[0].ordinal == tierOrdinal {
-				slot.tiers[0].seen = keyStamp
-			} else {
-				for t := 1; t < len(slot.tiers); t++ {
-					if slot.tiers[t].ordinal == tierOrdinal {
-						slot.tiers[t].seen = keyStamp
-						break
-					}
+			tiers := slot.tiers
+			for t := range tiers {
+				if tiers[t].ordinal == tierOrdinal {
+					tiers[t].seen = keyStamp
+					break
 				}
 			}
 		}
@@ -1252,14 +1246,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 							slot.tier0Seen = keyStamp
 						}
 					} else {
-						if slot.tiers[0].ordinal == entry.tierOrd {
-							slot.tiers[0].seen = keyStamp
-						} else {
-							for t := 1; t < len(slot.tiers); t++ {
-								if slot.tiers[t].ordinal == entry.tierOrd {
-									slot.tiers[t].seen = keyStamp
-									break
-								}
+						tiers := slot.tiers
+						for t := range tiers {
+							if tiers[t].ordinal == entry.tierOrd {
+								tiers[t].seen = keyStamp
+								break
 							}
 						}
 					}
@@ -1383,14 +1374,11 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				slot.tier0Seen = keyStamp
 			}
 		} else {
-			if slot.tiers[0].ordinal == tierOrd {
-				slot.tiers[0].seen = keyStamp
-			} else {
-				for t := 1; t < len(slot.tiers); t++ {
-					if slot.tiers[t].ordinal == tierOrd {
-						slot.tiers[t].seen = keyStamp
-						break
-					}
+			tiers := slot.tiers
+			for t := range tiers {
+				if tiers[t].ordinal == tierOrd {
+					tiers[t].seen = keyStamp
+					break
 				}
 			}
 		}

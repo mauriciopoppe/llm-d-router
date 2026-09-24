@@ -320,13 +320,14 @@ type matchSlot struct {
 type posCacheEntry struct {
 	podName       string
 	tierName      string
-	speculative   bool
+	weight        float64
 	podOrd        uint32
 	tierOrd       uint32
 	slot          int32
-	weight        float64
+	speculative   bool
 	confirmed     bool
 	isSingleTier0 bool
+	_             [1]byte
 }
 
 type posCacheEntryKey struct {

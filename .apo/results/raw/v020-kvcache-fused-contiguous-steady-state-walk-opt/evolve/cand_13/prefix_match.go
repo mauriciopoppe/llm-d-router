@@ -331,13 +331,12 @@ type posCacheEntry struct {
 
 type posCacheEntryKey struct {
 	podAndRawTier  uint64
-	weight         float64
 	slot           int32
-	tierOrd        uint32
-	isSingleTier0  bool
+	weight         float64
 	confirmed      bool
+	tierOrd        uint32
 	refSpeculative bool
-	_              [5]byte
+	isSingleTier0  bool
 }
 
 type podCacheEntry struct {
@@ -370,6 +369,7 @@ type prefixAccumulator struct {
 	active   []int32
 	keyStamp uint32
 	first    bool
+	allAliveAndSingleTier bool
 
 	// weightCache holds the weight of every tier seen in this accumulation,
 	// scanned linearly: requests see a handful of tiers.
@@ -431,6 +431,7 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	a.active = a.active[:0]
 	a.keyStamp = 0
 	a.first = true
+	a.allAliveAndSingleTier = false
 	a.weightCache = a.weightCache[:0]
 	if a.podsMap == nil {
 		a.podsMap = make(map[string]uint32, 128)
@@ -619,6 +620,24 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 		}
 	}
 	a.weightCacheSet = weightCacheSet
+	if len(entries) == len(a.slots) {
+		allMatch := true
+		for i := range entries {
+			if i >= len(a.posCache) {
+				allMatch = false
+				break
+			}
+			pc := &a.posCache[i]
+			slot := &a.slots[pc.slot]
+			if slot.isMultiTier || !slot.hasTier0 || pc.tierOrd != slot.tier0Ordinal || pc.refSpeculative {
+				allMatch = false
+				break
+			}
+		}
+		a.allAliveAndSingleTier = allMatch
+	} else {
+		a.allAliveAndSingleTier = false
+	}
 	return a.endKey()
 }
 
@@ -630,10 +649,38 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		return a.keyFirst(entries)
 	}
 
-	posCache := a.posCache
 	slots := a.slots
 	keyStamp := a.keyStamp
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
+
+	if a.allAliveAndSingleTier && len(entries) == len(slots) {
+		posCache := a.posCache
+		allHit := true
+		for i := range entries {
+			ref := &entries[i]
+			if i >= len(posCache) || *(*uint64)(unsafe.Pointer(&ref.PodOrdinal)) != posCache[i].podAndRawTier || ref.Speculative {
+				allHit = false
+				break
+			}
+		}
+		if allHit {
+			for i := range entries {
+				idx := posCache[i].slot
+				s := &slots[idx]
+				s.matched++
+				s.score += posCache[i].weight
+				s.weight = posCache[i].weight
+				s.confirmed++
+				s.tier0Count++
+				s.seen = keyStamp
+				s.confirmedSeen = keyStamp
+				s.tier0Seen = keyStamp
+			}
+			return true
+		}
+		a.allAliveAndSingleTier = false
+	}
+
+	posCache := a.posCache
 	mru := a.mru
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
@@ -657,7 +704,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
-					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
+					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
 				} else {
 					if entry.confirmed {
 						slot.confirmedSeen = keyStamp
@@ -1199,6 +1246,20 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 		}
 	}
 	a.weightCacheSet = weightCacheSet
+	if len(entries) == len(a.slots) && len(entries) <= 256 {
+		allMatch := true
+		for i := range entries {
+			pc := &a.posCache256[i]
+			slot := &a.slots[pc.slot]
+			if slot.isMultiTier || !slot.hasTier0 || pc.tierOrd != slot.tier0Ordinal || pc.speculative {
+				allMatch = false
+				break
+			}
+		}
+		a.allAliveAndSingleTier = allMatch
+	} else {
+		a.allAliveAndSingleTier = false
+	}
 	return a.endKey()
 }
 
@@ -1210,7 +1271,37 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 
 	slots := a.slots
 	keyStamp := a.keyStamp
-	expectedSeen := (uint64(keyStamp) << 32) | uint64(keyStamp)
+
+	if a.allAliveAndSingleTier && len(entries) == len(slots) && len(entries) <= 256 {
+		allHit := true
+		for i := range entries {
+			e := &entries[i]
+			pc := &a.posCache256[i]
+			if !(stringIdentical(pc.podName, e.PodIdentifier) || pc.podName == e.PodIdentifier) ||
+				!(stringIdentical(pc.tierName, e.DeviceTier) || pc.tierName == e.DeviceTier) ||
+				pc.speculative != e.Speculative {
+				allHit = false
+				break
+			}
+		}
+		if allHit {
+			for i := range entries {
+				idx := a.posCache256[i].slot
+				s := &slots[idx]
+				s.matched++
+				s.score += a.posCache256[i].weight
+				s.weight = a.posCache256[i].weight
+				s.confirmed++
+				s.tier0Count++
+				s.seen = keyStamp
+				s.confirmedSeen = keyStamp
+				s.tier0Seen = keyStamp
+			}
+			return true
+		}
+		a.allAliveAndSingleTier = false
+	}
+
 	weightCacheSet := a.weightCacheSet
 	weightCacheDirect := &a.weightCacheDirect
 
@@ -1241,7 +1332,7 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 					slot.weight = w
 				}
 				if entry.isSingleTier0 && !slot.isMultiTier {
-					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = expectedSeen
+					*(*uint64)(unsafe.Pointer(&slot.confirmedSeen)) = (uint64(keyStamp) << 32) | uint64(keyStamp)
 				} else {
 					if entry.confirmed {
 						slot.confirmedSeen = keyStamp

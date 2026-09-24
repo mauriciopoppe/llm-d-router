@@ -255,15 +255,22 @@ func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
 	}
 	mask := uint32(len(buckets) - 1)
 	i := (ordinal * 2654435761) & mask
+	b := buckets[i]
+	if b == 0 {
+		return 0, false
+	}
+	if uint32(b>>32) == ordinal {
+		return int32(uint32(b) - 1), true
+	}
 	for {
-		b := buckets[i]
+		i = (i + 1) & mask
+		b = buckets[i]
 		if b == 0 {
 			return 0, false
 		}
 		if uint32(b>>32) == ordinal {
 			return int32(uint32(b) - 1), true
 		}
-		i = (i + 1) & mask
 	}
 }
 
@@ -493,8 +500,7 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 		ref := &entries[i]
 		if i > 0 {
 			prev := &entries[i-1]
-			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
-				ref.Speculative == prev.Speculative {
+			if *(*uint64)(unsafe.Pointer(&ref.PodOrdinal)) == *(*uint64)(unsafe.Pointer(&prev.PodOrdinal)) && ref.Speculative == prev.Speculative {
 				continue
 			}
 		}
@@ -641,6 +647,13 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 	for i := range entries {
 		ref := &entries[i]
 
+		if i > 0 {
+			prev := &entries[i-1]
+			if *(*uint64)(unsafe.Pointer(&ref.PodOrdinal)) == *(*uint64)(unsafe.Pointer(&prev.PodOrdinal)) && ref.Speculative == prev.Speculative {
+				continue
+			}
+		}
+
 		if i < len(posCache) {
 			entry := &posCache[i]
 			if *(*uint64)(unsafe.Pointer(&ref.PodOrdinal)) == entry.podAndRawTier && entry.refSpeculative == ref.Speculative {
@@ -680,14 +693,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 						}
 					}
 				}
-				continue
-			}
-		}
-
-		if i > 0 {
-			prev := &entries[i-1]
-			if ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
-				ref.Speculative == prev.Speculative {
 				continue
 			}
 		}
@@ -1217,6 +1222,15 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 	for i := range entries {
 		e := &entries[i]
 
+		if i > 0 {
+			prev := &entries[i-1]
+			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
+				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
+				prev.Speculative == e.Speculative {
+				continue
+			}
+		}
+
 		var s int32
 		var podOrd uint32
 		var tierOrd uint32
@@ -1264,15 +1278,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						}
 					}
 				}
-				continue
-			}
-		}
-
-		if i > 0 {
-			prev := &entries[i-1]
-			if (stringIdentical(prev.PodIdentifier, e.PodIdentifier) || prev.PodIdentifier == e.PodIdentifier) &&
-				(stringIdentical(prev.DeviceTier, e.DeviceTier) || prev.DeviceTier == e.DeviceTier) &&
-				prev.Speculative == e.Speculative {
 				continue
 			}
 		}

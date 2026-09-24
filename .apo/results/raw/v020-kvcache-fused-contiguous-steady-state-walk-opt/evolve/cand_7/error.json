@@ -1,0 +1,5 @@
+{
+  "phase": "PREFLIGHT_BUILD",
+  "error_type": "UNIT_TEST_FAILURE",
+  "message": "go test ./pkg/kvcache/... failed during build validation. See build_output.log for details."
+}
