@@ -162,13 +162,13 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 func fastHash(s string) uint32 {
 	n := len(s)
 	if n >= 3 {
-		return uint32(s[n-1])*33 ^ uint32(s[n-2])*31 ^ uint32(s[n-3]) ^ uint32(n)
+		return uint32(s[n-1])*33 + uint32(s[n-2])*31 + uint32(s[n-3])
 	}
 	if n == 2 {
-		return uint32(s[1])*31 ^ uint32(s[0]) ^ 2
+		return uint32(s[1])*31 + uint32(s[0])
 	}
 	if n == 1 {
-		return uint32(s[0]) ^ 1
+		return uint32(s[0])
 	}
 	return 0
 }
@@ -180,21 +180,22 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
-	var podCacheName [1024]string
-	var podCacheOrd [1024]uint32
+	var podCacheName [256]string
+	var podCacheOrd [256]uint32
 
-	var posCacheName [256]string
-	var posCacheOrd [256]uint32
+	var posCacheName [128]string
+	var posCacheOrd [128]uint32
 
 	var mruName string
 	var mruOrd uint32
 	var hasMru bool
 
-	var tierCacheName [4]string
-	var tierCacheOrd [4]uint32
 	var lastTierName string
 	var lastTierOrd uint32
 	var hasLastTier bool
+
+	var tierCacheName [4]string
+	var tierCacheOrd [4]uint32
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
@@ -222,7 +223,7 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 				podOrd := acc.podOrdinal(e.PodIdentifier)
 
 				h := fastHash(e.PodIdentifier)
-				idx := h & 1023
+				idx := h & 255
 				for {
 					if podCacheName[idx] == "" {
 						podCacheName[idx] = e.PodIdentifier
@@ -232,10 +233,10 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 					if podCacheName[idx] == e.PodIdentifier {
 						break
 					}
-					idx = (idx + 1) & 1023
+					idx = (idx + 1) & 255
 				}
 
-				if i < 256 {
+				if i < len(posCacheName) {
 					posCacheName[i] = e.PodIdentifier
 					posCacheOrd[i] = podOrd
 				}
@@ -287,25 +288,23 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 			writeIdx := 0
 			for i := range entries {
 				e := &entries[i]
+
 				var podOrd uint32
 				found := false
 
-				if i < 256 && posCacheName[i] == e.PodIdentifier {
+				if i < len(posCacheName) && posCacheName[i] == e.PodIdentifier {
 					podOrd = posCacheOrd[i]
 					found = true
-					mruName = e.PodIdentifier
-					mruOrd = podOrd
-					hasMru = true
 				} else if hasMru && mruName == e.PodIdentifier {
 					podOrd = mruOrd
 					found = true
-					if i < 256 {
+					if i < len(posCacheName) {
 						posCacheName[i] = e.PodIdentifier
 						posCacheOrd[i] = podOrd
 					}
 				} else {
 					h := fastHash(e.PodIdentifier)
-					idx := h & 1023
+					idx := h & 255
 					for {
 						if podCacheName[idx] == "" {
 							break
@@ -315,13 +314,13 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 							found = true
 							break
 						}
-						idx = (idx + 1) & 1023
+						idx = (idx + 1) & 255
 					}
 					if found {
 						mruName = e.PodIdentifier
 						mruOrd = podOrd
 						hasMru = true
-						if i < 256 {
+						if i < len(posCacheName) {
 							posCacheName[i] = e.PodIdentifier
 							posCacheOrd[i] = podOrd
 						}

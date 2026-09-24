@@ -183,8 +183,8 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	var podCacheName [1024]string
 	var podCacheOrd [1024]uint32
 
-	var posCacheName [256]string
-	var posCacheOrd [256]uint32
+	var posCacheName [128]string
+	var posCacheOrd [128]uint32
 
 	var mruName string
 	var mruOrd uint32
@@ -192,6 +192,7 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 
 	var tierCacheName [4]string
 	var tierCacheOrd [4]uint32
+
 	var lastTierName string
 	var lastTierOrd uint32
 	var hasLastTier bool
@@ -212,11 +213,14 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 				allocCap = allocCap * 2
 			}
 			acc.refsBuf = make([]kvblock.EntryRef, allocCap)
+		} else {
+			acc.refsBuf = acc.refsBuf[:len(entries)]
 		}
-		acc.refsBuf = acc.refsBuf[:len(entries)]
+
+		refs := acc.refsBuf
+		writeIdx := 0
 
 		if pos == 0 {
-			writeIdx := 0
 			for i := range entries {
 				e := &entries[i]
 				podOrd := acc.podOrdinal(e.PodIdentifier)
@@ -235,7 +239,7 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 					idx = (idx + 1) & 1023
 				}
 
-				if i < 256 {
+				if i < 128 {
 					posCacheName[i] = e.PodIdentifier
 					posCacheOrd[i] = podOrd
 				}
@@ -276,30 +280,25 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 					hasLastTier = true
 				}
 
-				ref := &acc.refsBuf[writeIdx]
+				ref := &refs[writeIdx]
 				ref.PodEntry = *e
 				ref.PodOrdinal = podOrd
 				ref.TierOrdinal = tierOrd
 				writeIdx++
 			}
-			acc.refsBuf = acc.refsBuf[:writeIdx]
 		} else {
-			writeIdx := 0
 			for i := range entries {
 				e := &entries[i]
 				var podOrd uint32
 				found := false
 
-				if i < 256 && posCacheName[i] == e.PodIdentifier {
+				if i < 128 && posCacheName[i] == e.PodIdentifier {
 					podOrd = posCacheOrd[i]
 					found = true
-					mruName = e.PodIdentifier
-					mruOrd = podOrd
-					hasMru = true
 				} else if hasMru && mruName == e.PodIdentifier {
 					podOrd = mruOrd
 					found = true
-					if i < 256 {
+					if i < 128 {
 						posCacheName[i] = e.PodIdentifier
 						posCacheOrd[i] = podOrd
 					}
@@ -321,7 +320,7 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 						mruName = e.PodIdentifier
 						mruOrd = podOrd
 						hasMru = true
-						if i < 256 {
+						if i < 128 {
 							posCacheName[i] = e.PodIdentifier
 							posCacheOrd[i] = podOrd
 						}
@@ -365,14 +364,15 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 					hasLastTier = true
 				}
 
-				ref := &acc.refsBuf[writeIdx]
+				ref := &refs[writeIdx]
 				ref.PodEntry = *e
 				ref.PodOrdinal = podOrd
 				ref.TierOrdinal = tierOrd
 				writeIdx++
 			}
-			acc.refsBuf = acc.refsBuf[:writeIdx]
 		}
+
+		acc.refsBuf = refs[:writeIdx]
 
 		if !acc.key(acc.refsBuf) {
 			break

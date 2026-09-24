@@ -190,11 +190,12 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	var mruOrd uint32
 	var hasMru bool
 
-	var tierCacheName [4]string
-	var tierCacheOrd [4]uint32
 	var lastTierName string
 	var lastTierOrd uint32
 	var hasLastTier bool
+
+	var tierCacheName [4]string
+	var tierCacheOrd [4]uint32
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
@@ -287,15 +288,13 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 			writeIdx := 0
 			for i := range entries {
 				e := &entries[i]
+
 				var podOrd uint32
 				found := false
 
 				if i < 256 && posCacheName[i] == e.PodIdentifier {
 					podOrd = posCacheOrd[i]
 					found = true
-					mruName = e.PodIdentifier
-					mruOrd = podOrd
-					hasMru = true
 				} else if hasMru && mruName == e.PodIdentifier {
 					podOrd = mruOrd
 					found = true
