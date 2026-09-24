@@ -301,22 +301,22 @@ type matchSlot struct {
 }
 
 type posCacheEntry struct {
-	podName     string
-	tierName    string
-	speculative bool
-	podOrd      uint32
-	tierOrd     uint32
-	slot        int32
-	weight      float64
-	confirmed   bool
+	podName      string
+	tierName     string
+	speculative  bool
+	podOrd       uint32
+	tierOrd      uint32
+	slot         int32
+	cachedWeight float64
+	isConfirmed  bool
 }
 
-type posCacheEntryKey struct {
-	podOrd    uint32
-	slot      int32
-	weight    float64
-	confirmed bool
-	tierOrd   uint32
+type posCacheKeyEntry struct {
+	podOrd      uint32
+	slot        int32
+	weight      float64
+	tierOrd     uint32
+	isConfirmed bool
 }
 
 type podCacheEntry struct {
@@ -358,7 +358,7 @@ type prefixAccumulator struct {
 	tiersMap map[string]uint32
 	refsBuf  []kvblock.EntryRef
 
-	posCache             []posCacheEntryKey
+	posCache             []posCacheKeyEntry
 	mru                  uint64
 	weightCacheDirect    [64]float64
 	weightCacheSet       uint64
@@ -395,7 +395,7 @@ var accumulatorPool = sync.Pool{New: func() any {
 		podsMap:       make(map[string]uint32, 128),
 		tiersMap:      make(map[string]uint32, 16),
 		refsBuf:       make([]kvblock.EntryRef, 0, 512),
-		posCache:      make([]posCacheEntryKey, 0, 512),
+		posCache:      make([]posCacheKeyEntry, 0, 512),
 		singularCache: make(map[string][]map[string]int, 8),
 	}
 }}
@@ -453,7 +453,7 @@ func releaseAccumulator(a *prefixAccumulator) {
 func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	a.table.reset(len(entries))
 	if cap(a.posCache) < len(entries) {
-		a.posCache = make([]posCacheEntryKey, len(entries))
+		a.posCache = make([]posCacheKeyEntry, len(entries))
 	} else {
 		a.posCache = a.posCache[:len(entries)]
 	}
@@ -505,6 +505,16 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 			w = a.weightOf(tier, tierOrdinal)
 		}
 
+		if i < len(a.posCache) {
+			a.posCache[i] = posCacheKeyEntry{
+				podOrd:      ref.PodOrdinal,
+				slot:        s,
+				weight:      w,
+				tierOrd:     tierOrdinal,
+				isConfirmed: (tierOrdinal != speculativeTierOrdinal),
+			}
+		}
+
 		if slot.seen != a.keyStamp {
 			slot.seen = a.keyStamp
 			slot.weight = w
@@ -514,16 +524,6 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 
 		if !a.stampTier(slot, tierOrdinal) {
 			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
-		}
-
-		if i < len(a.posCache) {
-			a.posCache[i] = posCacheEntryKey{
-				podOrd:    ref.PodOrdinal,
-				slot:      s,
-				weight:    w,
-				confirmed: tierOrdinal != speculativeTierOrdinal,
-				tierOrd:   tierOrdinal,
-			}
 		}
 	}
 	a.weightCacheSet = weightCacheSet
@@ -558,17 +558,13 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 
 		if i < len(posCache) {
 			entry := &posCache[i]
-			expectedTierOrd := ref.TierOrdinal
-			if ref.Speculative || ref.DeviceTier == SpeculativeTier {
-				expectedTierOrd = speculativeTierOrdinal
-			}
-			if entry.podOrd == ref.PodOrdinal && entry.tierOrd == expectedTierOrd {
+			if entry.podOrd == ref.PodOrdinal {
 				s := entry.slot
 				slot := &slots[s]
 				if slot.seen < keyStamp-1 {
 					continue
 				}
-				if entry.confirmed {
+				if entry.isConfirmed {
 					slot.confirmedSeen = keyStamp
 				}
 				w := entry.weight
@@ -578,14 +574,14 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 				} else if w > slot.weight {
 					slot.weight = w
 				}
-				// stampTier inline
 				tiers := slot.tiers
+				tierOrd := entry.tierOrd
 				if len(tiers) > 0 {
-					if tiers[0].ordinal == entry.tierOrd {
+					if tiers[0].ordinal == tierOrd {
 						tiers[0].seen = keyStamp
 					} else if len(tiers) > 1 {
 						for t := 1; t < len(tiers); t++ {
-							if tiers[t].ordinal == entry.tierOrd {
+							if tiers[t].ordinal == tierOrd {
 								tiers[t].seen = keyStamp
 								break
 							}
@@ -637,6 +633,16 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			w = a.weightOf(tier, tierOrdinal)
 		}
 
+		if i < len(posCache) {
+			posCache[i] = posCacheKeyEntry{
+				podOrd:      ref.PodOrdinal,
+				slot:        s,
+				weight:      w,
+				tierOrd:     tierOrdinal,
+				isConfirmed: (tierOrdinal != speculativeTierOrdinal),
+			}
+		}
+
 		if slot.seen != keyStamp {
 			slot.seen = keyStamp
 			slot.weight = w
@@ -656,16 +662,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 						break
 					}
 				}
-			}
-		}
-
-		if i < len(posCache) {
-			posCache[i] = posCacheEntryKey{
-				podOrd:    ref.PodOrdinal,
-				slot:      s,
-				weight:    w,
-				confirmed: tierOrdinal != speculativeTierOrdinal,
-				tierOrd:   tierOrdinal,
 			}
 		}
 	}
@@ -905,6 +901,19 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			w = a.weightOf(tier, tierOrd)
 		}
 
+		if i < 256 {
+			a.posCache256[i] = posCacheEntry{
+				podName:      e.PodIdentifier,
+				tierName:     e.DeviceTier,
+				speculative:  e.Speculative,
+				podOrd:       podOrd,
+				tierOrd:      tierOrd,
+				slot:         s,
+				cachedWeight: w,
+				isConfirmed:  (tierOrd != speculativeTierOrdinal),
+			}
+		}
+
 		if slot.seen != a.keyStamp {
 			slot.seen = a.keyStamp
 			slot.weight = w
@@ -914,19 +923,6 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 
 		if !a.stampTier(slot, tierOrd) {
 			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrd, name: tier, seen: a.keyStamp, alive: true})
-		}
-
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
-				podName:     e.PodIdentifier,
-				tierName:    e.DeviceTier,
-				speculative: e.Speculative,
-				podOrd:      podOrd,
-				tierOrd:     tierOrd,
-				slot:        s,
-				weight:      w,
-				confirmed:   tierOrd != speculativeTierOrdinal,
-			}
 		}
 	}
 	a.weightCacheSet = weightCacheSet
@@ -953,38 +949,34 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		var s int32
-		var podOrd uint32
-		var tierOrd uint32
-		var tier string
-		var ok bool
-
 		if i < 256 {
 			entry := &a.posCache256[i]
-			if entry.podName == e.PodIdentifier && entry.tierName == e.DeviceTier && entry.speculative == e.Speculative {
+			if entry.podName == e.PodIdentifier &&
+				entry.tierName == e.DeviceTier &&
+				entry.speculative == e.Speculative {
 				s := entry.slot
 				slot := &slots[s]
 				if slot.seen < keyStamp-1 {
 					continue
 				}
-				if entry.confirmed {
+				if entry.isConfirmed {
 					slot.confirmedSeen = keyStamp
 				}
-				w := entry.weight
+				w := entry.cachedWeight
 				if slot.seen != keyStamp {
 					slot.seen = keyStamp
 					slot.weight = w
 				} else if w > slot.weight {
 					slot.weight = w
 				}
-				// stampTier inline
 				tiers := slot.tiers
+				tierOrd := entry.tierOrd
 				if len(tiers) > 0 {
-					if tiers[0].ordinal == entry.tierOrd {
+					if tiers[0].ordinal == tierOrd {
 						tiers[0].seen = keyStamp
 					} else if len(tiers) > 1 {
 						for t := 1; t < len(tiers); t++ {
-							if tiers[t].ordinal == entry.tierOrd {
+							if tiers[t].ordinal == tierOrd {
 								tiers[t].seen = keyStamp
 								break
 							}
@@ -997,6 +989,12 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				continue
 			}
 		}
+
+		var s int32
+		var podOrd uint32
+		var tierOrd uint32
+		var tier string
+		var ok bool
 
 		var found bool
 		if a.hasMru && a.mruName == e.PodIdentifier {
@@ -1092,6 +1090,19 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			w = a.weightOf(tier, tierOrd)
 		}
 
+		if i < 256 {
+			a.posCache256[i] = posCacheEntry{
+				podName:      e.PodIdentifier,
+				tierName:     e.DeviceTier,
+				speculative:  e.Speculative,
+				podOrd:       podOrd,
+				tierOrd:      tierOrd,
+				slot:         s,
+				cachedWeight: w,
+				isConfirmed:  (tierOrd != speculativeTierOrdinal),
+			}
+		}
+
 		if slot.seen != keyStamp {
 			slot.seen = keyStamp
 			slot.weight = w
@@ -1110,19 +1121,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						break
 					}
 				}
-			}
-		}
-
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
-				podName:     e.PodIdentifier,
-				tierName:    e.DeviceTier,
-				speculative: e.Speculative,
-				podOrd:      podOrd,
-				tierOrd:     tierOrd,
-				slot:        s,
-				weight:      w,
-				confirmed:   tierOrd != speculativeTierOrdinal,
 			}
 		}
 	}

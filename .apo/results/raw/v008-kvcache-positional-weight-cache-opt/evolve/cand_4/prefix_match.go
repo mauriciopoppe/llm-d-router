@@ -311,12 +311,14 @@ type posCacheEntry struct {
 	confirmed   bool
 }
 
-type posCacheEntryKey struct {
-	podOrd    uint32
-	slot      int32
-	weight    float64
-	confirmed bool
-	tierOrd   uint32
+type posRefEntry struct {
+	podOrdinal      uint32
+	origTierOrdinal uint32
+	speculative     bool
+	slot            int32
+	tierOrdinal     uint32
+	weight          float64
+	confirmed       bool
 }
 
 type podCacheEntry struct {
@@ -358,7 +360,7 @@ type prefixAccumulator struct {
 	tiersMap map[string]uint32
 	refsBuf  []kvblock.EntryRef
 
-	posCache             []posCacheEntryKey
+	posCache             []posRefEntry
 	mru                  uint64
 	weightCacheDirect    [64]float64
 	weightCacheSet       uint64
@@ -395,7 +397,7 @@ var accumulatorPool = sync.Pool{New: func() any {
 		podsMap:       make(map[string]uint32, 128),
 		tiersMap:      make(map[string]uint32, 16),
 		refsBuf:       make([]kvblock.EntryRef, 0, 512),
-		posCache:      make([]posCacheEntryKey, 0, 512),
+		posCache:      make([]posRefEntry, 0, 512),
 		singularCache: make(map[string][]map[string]int, 8),
 	}
 }}
@@ -453,12 +455,12 @@ func releaseAccumulator(a *prefixAccumulator) {
 func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 	a.table.reset(len(entries))
 	if cap(a.posCache) < len(entries) {
-		a.posCache = make([]posCacheEntryKey, len(entries))
+		a.posCache = make([]posRefEntry, len(entries))
 	} else {
 		a.posCache = a.posCache[:len(entries)]
 	}
 	for i := range a.posCache {
-		a.posCache[i].podOrd = ^uint32(0)
+		a.posCache[i].podOrdinal = ^uint32(0)
 	}
 
 	weightCacheDirect := &a.weightCacheDirect
@@ -505,6 +507,18 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 			w = a.weightOf(tier, tierOrdinal)
 		}
 
+		if i < len(a.posCache) {
+			a.posCache[i] = posRefEntry{
+				podOrdinal:      ref.PodOrdinal,
+				origTierOrdinal: ref.TierOrdinal,
+				speculative:     ref.Speculative,
+				slot:            s,
+				tierOrdinal:     tierOrdinal,
+				weight:          w,
+				confirmed:       (tierOrdinal != speculativeTierOrdinal),
+			}
+		}
+
 		if slot.seen != a.keyStamp {
 			slot.seen = a.keyStamp
 			slot.weight = w
@@ -514,16 +528,6 @@ func (a *prefixAccumulator) keyFirst(entries []kvblock.EntryRef) bool {
 
 		if !a.stampTier(slot, tierOrdinal) {
 			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
-		}
-
-		if i < len(a.posCache) {
-			a.posCache[i] = posCacheEntryKey{
-				podOrd:    ref.PodOrdinal,
-				slot:      s,
-				weight:    w,
-				confirmed: tierOrdinal != speculativeTierOrdinal,
-				tierOrd:   tierOrdinal,
-			}
 		}
 	}
 	a.weightCacheSet = weightCacheSet
@@ -556,92 +560,86 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		}
 		prev = ref
 
-		if i < len(posCache) {
-			entry := &posCache[i]
-			expectedTierOrd := ref.TierOrdinal
-			if ref.Speculative || ref.DeviceTier == SpeculativeTier {
-				expectedTierOrd = speculativeTierOrdinal
-			}
-			if entry.podOrd == ref.PodOrdinal && entry.tierOrd == expectedTierOrd {
-				s := entry.slot
-				slot := &slots[s]
-				if slot.seen < keyStamp-1 {
-					continue
-				}
-				if entry.confirmed {
-					slot.confirmedSeen = keyStamp
-				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
-				}
-				// stampTier inline
-				tiers := slot.tiers
-				if len(tiers) > 0 {
-					if tiers[0].ordinal == entry.tierOrd {
-						tiers[0].seen = keyStamp
-					} else if len(tiers) > 1 {
-						for t := 1; t < len(tiers); t++ {
-							if tiers[t].ordinal == entry.tierOrd {
-								tiers[t].seen = keyStamp
-								break
-							}
-						}
-					}
-				}
-				continue
-			}
-		}
-
 		var s int32
 		var ok bool
-		if uint32(mru>>32) == ref.PodOrdinal {
-			s = int32(mru)
-			ok = true
-		} else {
-			s, ok = a.table.lookup(ref.PodOrdinal)
-			if ok {
-				mru = (uint64(ref.PodOrdinal) << 32) | uint64(uint32(s))
+		var cachedWeight float64
+		var confirmed bool
+		var tierOrdinal uint32
+
+		if i < len(posCache) {
+			refEntry := &posCache[i]
+			if refEntry.podOrdinal == ref.PodOrdinal &&
+				refEntry.origTierOrdinal == ref.TierOrdinal &&
+				refEntry.speculative == ref.Speculative {
+				s = refEntry.slot
+				cachedWeight = refEntry.weight
+				confirmed = refEntry.confirmed
+				tierOrdinal = refEntry.tierOrdinal
+				ok = true
+			}
+		}
+		if !ok {
+			if uint32(mru>>32) == ref.PodOrdinal {
+				s = int32(mru)
+				ok = true
+			} else {
+				s, ok = a.table.lookup(ref.PodOrdinal)
+				if ok {
+					mru = (uint64(ref.PodOrdinal) << 32) | uint64(uint32(s))
+				}
+			}
+			if !ok {
+				continue // the first key fixes the candidate set
+			}
+
+			// Full resolution on miss
+			tier, tOrd := ref.DeviceTier, ref.TierOrdinal
+			if ref.Speculative || ref.DeviceTier == SpeculativeTier {
+				tier, tOrd = SpeculativeTier, speculativeTierOrdinal
+			}
+			tierOrdinal = tOrd
+			confirmed = (tOrd != speculativeTierOrdinal)
+
+			if tOrd < 64 {
+				if (weightCacheSet & (1 << tOrd)) != 0 {
+					cachedWeight = weightCacheDirect[tOrd]
+				} else {
+					cachedWeight = a.weightOf(tier, tOrd)
+					weightCacheSet = a.weightCacheSet
+				}
+			} else if tOrd == speculativeTierOrdinal && a.speculativeWeightSet {
+				cachedWeight = a.speculativeWeight
+			} else {
+				cachedWeight = a.weightOf(tier, tOrd)
+			}
+
+			if i < len(posCache) {
+				posCache[i] = posRefEntry{
+					podOrdinal:      ref.PodOrdinal,
+					origTierOrdinal: ref.TierOrdinal,
+					speculative:     ref.Speculative,
+					slot:            s,
+					tierOrdinal:     tierOrdinal,
+					weight:          cachedWeight,
+					confirmed:       confirmed,
+				}
 			}
 		}
 
-		if !ok {
-			continue // the first key fixes the candidate set
-		}
 		slot := &slots[s]
 		if slot.seen < keyStamp-1 {
 			continue // entries for dead slots should be pruned early
 		}
 
-		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
-		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
-			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
-		} else {
+		if confirmed {
 			slot.confirmedSeen = keyStamp
-		}
-
-		var w float64
-		if tierOrdinal < 64 {
-			if (weightCacheSet & (1 << tierOrdinal)) != 0 {
-				w = weightCacheDirect[tierOrdinal]
-			} else {
-				w = a.weightOf(tier, tierOrdinal)
-				weightCacheSet = a.weightCacheSet
-			}
-		} else if tierOrdinal == speculativeTierOrdinal && a.speculativeWeightSet {
-			w = a.speculativeWeight
-		} else {
-			w = a.weightOf(tier, tierOrdinal)
 		}
 
 		if slot.seen != keyStamp {
 			slot.seen = keyStamp
-			slot.weight = w
-		} else if w > slot.weight {
-			slot.weight = w
+			slot.weight = cachedWeight
+		} else if cachedWeight > slot.weight {
+			slot.weight = cachedWeight
 		}
 
 		// stampTier inline
@@ -656,16 +654,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 						break
 					}
 				}
-			}
-		}
-
-		if i < len(posCache) {
-			posCache[i] = posCacheEntryKey{
-				podOrd:    ref.PodOrdinal,
-				slot:      s,
-				weight:    w,
-				confirmed: tierOrdinal != speculativeTierOrdinal,
-				tierOrd:   tierOrdinal,
 			}
 		}
 	}
@@ -905,17 +893,6 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 			w = a.weightOf(tier, tierOrd)
 		}
 
-		if slot.seen != a.keyStamp {
-			slot.seen = a.keyStamp
-			slot.weight = w
-		} else if w > slot.weight {
-			slot.weight = w
-		}
-
-		if !a.stampTier(slot, tierOrd) {
-			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrd, name: tier, seen: a.keyStamp, alive: true})
-		}
-
 		if i < 256 {
 			a.posCache256[i] = posCacheEntry{
 				podName:     e.PodIdentifier,
@@ -925,8 +902,19 @@ func (a *prefixAccumulator) keyPodsFirst(entries []kvblock.PodEntry) bool {
 				tierOrd:     tierOrd,
 				slot:        s,
 				weight:      w,
-				confirmed:   tierOrd != speculativeTierOrdinal,
+				confirmed:   (tierOrd != speculativeTierOrdinal),
 			}
+		}
+
+		if slot.seen != a.keyStamp {
+			slot.seen = a.keyStamp
+			slot.weight = w
+		} else if w > slot.weight {
+			slot.weight = w
+		}
+
+		if !a.stampTier(slot, tierOrd) {
+			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrd, name: tier, seen: a.keyStamp, alive: true})
 		}
 	}
 	a.weightCacheSet = weightCacheSet
@@ -958,114 +946,119 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		var tierOrd uint32
 		var tier string
 		var ok bool
+		var cachedWeight float64
+		var confirmed bool
 
-		if i < 256 {
-			entry := &a.posCache256[i]
-			if entry.podName == e.PodIdentifier && entry.tierName == e.DeviceTier && entry.speculative == e.Speculative {
-				s := entry.slot
-				slot := &slots[s]
-				if slot.seen < keyStamp-1 {
-					continue
-				}
-				if entry.confirmed {
-					slot.confirmedSeen = keyStamp
-				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
-				}
-				// stampTier inline
-				tiers := slot.tiers
-				if len(tiers) > 0 {
-					if tiers[0].ordinal == entry.tierOrd {
-						tiers[0].seen = keyStamp
-					} else if len(tiers) > 1 {
-						for t := 1; t < len(tiers); t++ {
-							if tiers[t].ordinal == entry.tierOrd {
-								tiers[t].seen = keyStamp
-								break
-							}
-						}
-					}
-				}
-				a.mruName = e.PodIdentifier
-				a.mruOrd = entry.podOrd
-				a.hasMru = true
-				continue
-			}
-		}
-
-		var found bool
-		if a.hasMru && a.mruName == e.PodIdentifier {
-			podOrd = a.mruOrd
-			found = true
+		if i < 256 && a.posCache256[i].podName == e.PodIdentifier &&
+			a.posCache256[i].tierName == e.DeviceTier &&
+			a.posCache256[i].speculative == e.Speculative {
+			s = a.posCache256[i].slot
+			podOrd = a.posCache256[i].podOrd
+			tierOrd = a.posCache256[i].tierOrd
+			cachedWeight = a.posCache256[i].weight
+			confirmed = a.posCache256[i].confirmed
+			ok = true
+			a.mruName = e.PodIdentifier
+			a.mruOrd = podOrd
+			a.hasMru = true
 		} else {
-			h := fastHash(e.PodIdentifier)
-			idx := h & 1023
-			if a.podCache[idx].name == e.PodIdentifier {
-				podOrd = a.podCache[idx].ord
+			var found bool
+			if a.hasMru && a.mruName == e.PodIdentifier {
+				podOrd = a.mruOrd
 				found = true
 			} else {
-				podOrd, found = a.podsMap[e.PodIdentifier]
-				if found {
-					a.podCache[idx].name = e.PodIdentifier
-					a.podCache[idx].ord = podOrd
-				}
-			}
-			if found {
-				a.mruName = e.PodIdentifier
-				a.mruOrd = podOrd
-				a.hasMru = true
-			}
-		}
-
-		if !found {
-			continue
-		}
-
-		s, ok = a.table.lookup(podOrd)
-		if !ok {
-			continue
-		}
-
-		if e.Speculative || e.DeviceTier == SpeculativeTier {
-			tier = SpeculativeTier
-			tierOrd = speculativeTierOrdinal
-		} else {
-			tier = e.DeviceTier
-			if a.hasLastTier && a.lastTierName == e.DeviceTier {
-				tierOrd = a.lastTierOrd
-			} else {
-				if a.tierCache[0].name == e.DeviceTier {
-					tierOrd = a.tierCache[0].ord
-				} else if a.tierCache[1].name == e.DeviceTier {
-					tierOrd = a.tierCache[1].ord
-				} else if a.tierCache[2].name == e.DeviceTier {
-					tierOrd = a.tierCache[2].ord
-				} else if a.tierCache[3].name == e.DeviceTier {
-					tierOrd = a.tierCache[3].ord
+				h := fastHash(e.PodIdentifier)
+				idx := h & 1023
+				if a.podCache[idx].name == e.PodIdentifier {
+					podOrd = a.podCache[idx].ord
+					found = true
 				} else {
-					tierOrd = a.tierOrdinal(e.DeviceTier)
-					if a.tierCache[0].name == "" {
-						a.tierCache[0].name = e.DeviceTier
-						a.tierCache[0].ord = tierOrd
-					} else if a.tierCache[1].name == "" {
-						a.tierCache[1].name = e.DeviceTier
-						a.tierCache[1].ord = tierOrd
-					} else if a.tierCache[2].name == "" {
-						a.tierCache[2].name = e.DeviceTier
-						a.tierCache[2].ord = tierOrd
-					} else if a.tierCache[3].name == "" {
-						a.tierCache[3].name = e.DeviceTier
-						a.tierCache[3].ord = tierOrd
+					podOrd, found = a.podsMap[e.PodIdentifier]
+					if found {
+						a.podCache[idx].name = e.PodIdentifier
+						a.podCache[idx].ord = podOrd
 					}
 				}
-				a.lastTierName = e.DeviceTier
-				a.lastTierOrd = tierOrd
-				a.hasLastTier = true
+				if found {
+					a.mruName = e.PodIdentifier
+					a.mruOrd = podOrd
+					a.hasMru = true
+				}
+			}
+
+			if !found {
+				continue
+			}
+
+			s, ok = a.table.lookup(podOrd)
+			if !ok {
+				continue
+			}
+
+			if e.Speculative || e.DeviceTier == SpeculativeTier {
+				tier = SpeculativeTier
+				tierOrd = speculativeTierOrdinal
+			} else {
+				tier = e.DeviceTier
+				if a.hasLastTier && a.lastTierName == e.DeviceTier {
+					tierOrd = a.lastTierOrd
+				} else {
+					if a.tierCache[0].name == e.DeviceTier {
+						tierOrd = a.tierCache[0].ord
+					} else if a.tierCache[1].name == e.DeviceTier {
+						tierOrd = a.tierCache[1].ord
+					} else if a.tierCache[2].name == e.DeviceTier {
+						tierOrd = a.tierCache[2].ord
+					} else if a.tierCache[3].name == e.DeviceTier {
+						tierOrd = a.tierCache[3].ord
+					} else {
+						tierOrd = a.tierOrdinal(e.DeviceTier)
+						if a.tierCache[0].name == "" {
+							a.tierCache[0].name = e.DeviceTier
+							a.tierCache[0].ord = tierOrd
+						} else if a.tierCache[1].name == "" {
+							a.tierCache[1].name = e.DeviceTier
+							a.tierCache[1].ord = tierOrd
+						} else if a.tierCache[2].name == "" {
+							a.tierCache[2].name = e.DeviceTier
+							a.tierCache[2].ord = tierOrd
+						} else if a.tierCache[3].name == "" {
+							a.tierCache[3].name = e.DeviceTier
+							a.tierCache[3].ord = tierOrd
+						}
+					}
+					a.lastTierName = e.DeviceTier
+					a.lastTierOrd = tierOrd
+					a.hasLastTier = true
+				}
+			}
+
+			confirmed = (tierOrd != speculativeTierOrdinal)
+
+			if tierOrd < 64 {
+				if (weightCacheSet & (1 << tierOrd)) != 0 {
+					cachedWeight = weightCacheDirect[tierOrd]
+				} else {
+					cachedWeight = a.weightOf(tier, tierOrd)
+					weightCacheSet = a.weightCacheSet
+				}
+			} else if tierOrd == speculativeTierOrdinal && a.speculativeWeightSet {
+				cachedWeight = a.speculativeWeight
+			} else {
+				cachedWeight = a.weightOf(tier, tierOrd)
+			}
+
+			if i < 256 {
+				a.posCache256[i] = posCacheEntry{
+					podName:     e.PodIdentifier,
+					tierName:    e.DeviceTier,
+					speculative: e.Speculative,
+					podOrd:      podOrd,
+					tierOrd:     tierOrd,
+					slot:        s,
+					weight:      cachedWeight,
+					confirmed:   confirmed,
+				}
 			}
 		}
 
@@ -1074,29 +1067,15 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			continue
 		}
 
-		if tierOrd != speculativeTierOrdinal {
+		if confirmed {
 			slot.confirmedSeen = keyStamp
-		}
-
-		var w float64
-		if tierOrd < 64 {
-			if (weightCacheSet & (1 << tierOrd)) != 0 {
-				w = weightCacheDirect[tierOrd]
-			} else {
-				w = a.weightOf(tier, tierOrd)
-				weightCacheSet = a.weightCacheSet
-			}
-		} else if tierOrd == speculativeTierOrdinal && a.speculativeWeightSet {
-			w = a.speculativeWeight
-		} else {
-			w = a.weightOf(tier, tierOrd)
 		}
 
 		if slot.seen != keyStamp {
 			slot.seen = keyStamp
-			slot.weight = w
-		} else if w > slot.weight {
-			slot.weight = w
+			slot.weight = cachedWeight
+		} else if cachedWeight > slot.weight {
+			slot.weight = cachedWeight
 		}
 
 		tiers := slot.tiers
@@ -1110,19 +1089,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						break
 					}
 				}
-			}
-		}
-
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
-				podName:     e.PodIdentifier,
-				tierName:    e.DeviceTier,
-				speculative: e.Speculative,
-				podOrd:      podOrd,
-				tierOrd:     tierOrd,
-				slot:        s,
-				weight:      w,
-				confirmed:   tierOrd != speculativeTierOrdinal,
 			}
 		}
 	}

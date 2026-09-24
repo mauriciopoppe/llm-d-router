@@ -953,12 +953,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 			}
 		}
 
-		var s int32
-		var podOrd uint32
-		var tierOrd uint32
-		var tier string
-		var ok bool
-
 		if i < 256 {
 			entry := &a.posCache256[i]
 			if entry.podName == e.PodIdentifier && entry.tierName == e.DeviceTier && entry.speculative == e.Speculative {
@@ -997,6 +991,12 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 				continue
 			}
 		}
+
+		var s int32
+		var podOrd uint32
+		var tierOrd uint32
+		var tier string
+		var ok bool
 
 		var found bool
 		if a.hasMru && a.mruName == e.PodIdentifier {

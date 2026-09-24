@@ -959,113 +959,102 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 		var tier string
 		var ok bool
 
-		if i < 256 {
-			entry := &a.posCache256[i]
-			if entry.podName == e.PodIdentifier && entry.tierName == e.DeviceTier && entry.speculative == e.Speculative {
-				s := entry.slot
-				slot := &slots[s]
-				if slot.seen < keyStamp-1 {
-					continue
-				}
-				if entry.confirmed {
-					slot.confirmedSeen = keyStamp
-				}
-				w := entry.weight
-				if slot.seen != keyStamp {
-					slot.seen = keyStamp
-					slot.weight = w
-				} else if w > slot.weight {
-					slot.weight = w
-				}
-				// stampTier inline
-				tiers := slot.tiers
-				if len(tiers) > 0 {
-					if tiers[0].ordinal == entry.tierOrd {
-						tiers[0].seen = keyStamp
-					} else if len(tiers) > 1 {
-						for t := 1; t < len(tiers); t++ {
-							if tiers[t].ordinal == entry.tierOrd {
-								tiers[t].seen = keyStamp
-								break
-							}
-						}
-					}
-				}
-				a.mruName = e.PodIdentifier
-				a.mruOrd = entry.podOrd
-				a.hasMru = true
-				continue
+		if i < 256 && a.posCache256[i].podName == e.PodIdentifier &&
+			a.posCache256[i].tierName == e.DeviceTier &&
+			a.posCache256[i].speculative == e.Speculative {
+			s = a.posCache256[i].slot
+			podOrd = a.posCache256[i].podOrd
+			tierOrd = a.posCache256[i].tierOrd
+			if e.Speculative || e.DeviceTier == SpeculativeTier {
+				tier = SpeculativeTier
+			} else {
+				tier = e.DeviceTier
 			}
-		}
-
-		var found bool
-		if a.hasMru && a.mruName == e.PodIdentifier {
-			podOrd = a.mruOrd
-			found = true
+			ok = true
+			a.mruName = e.PodIdentifier
+			a.mruOrd = podOrd
+			a.hasMru = true
 		} else {
-			h := fastHash(e.PodIdentifier)
-			idx := h & 1023
-			if a.podCache[idx].name == e.PodIdentifier {
-				podOrd = a.podCache[idx].ord
+			var found bool
+			if a.hasMru && a.mruName == e.PodIdentifier {
+				podOrd = a.mruOrd
 				found = true
 			} else {
-				podOrd, found = a.podsMap[e.PodIdentifier]
-				if found {
-					a.podCache[idx].name = e.PodIdentifier
-					a.podCache[idx].ord = podOrd
-				}
-			}
-			if found {
-				a.mruName = e.PodIdentifier
-				a.mruOrd = podOrd
-				a.hasMru = true
-			}
-		}
-
-		if !found {
-			continue
-		}
-
-		s, ok = a.table.lookup(podOrd)
-		if !ok {
-			continue
-		}
-
-		if e.Speculative || e.DeviceTier == SpeculativeTier {
-			tier = SpeculativeTier
-			tierOrd = speculativeTierOrdinal
-		} else {
-			tier = e.DeviceTier
-			if a.hasLastTier && a.lastTierName == e.DeviceTier {
-				tierOrd = a.lastTierOrd
-			} else {
-				if a.tierCache[0].name == e.DeviceTier {
-					tierOrd = a.tierCache[0].ord
-				} else if a.tierCache[1].name == e.DeviceTier {
-					tierOrd = a.tierCache[1].ord
-				} else if a.tierCache[2].name == e.DeviceTier {
-					tierOrd = a.tierCache[2].ord
-				} else if a.tierCache[3].name == e.DeviceTier {
-					tierOrd = a.tierCache[3].ord
+				h := fastHash(e.PodIdentifier)
+				idx := h & 1023
+				if a.podCache[idx].name == e.PodIdentifier {
+					podOrd = a.podCache[idx].ord
+					found = true
 				} else {
-					tierOrd = a.tierOrdinal(e.DeviceTier)
-					if a.tierCache[0].name == "" {
-						a.tierCache[0].name = e.DeviceTier
-						a.tierCache[0].ord = tierOrd
-					} else if a.tierCache[1].name == "" {
-						a.tierCache[1].name = e.DeviceTier
-						a.tierCache[1].ord = tierOrd
-					} else if a.tierCache[2].name == "" {
-						a.tierCache[2].name = e.DeviceTier
-						a.tierCache[2].ord = tierOrd
-					} else if a.tierCache[3].name == "" {
-						a.tierCache[3].name = e.DeviceTier
-						a.tierCache[3].ord = tierOrd
+					podOrd, found = a.podsMap[e.PodIdentifier]
+					if found {
+						a.podCache[idx].name = e.PodIdentifier
+						a.podCache[idx].ord = podOrd
 					}
 				}
-				a.lastTierName = e.DeviceTier
-				a.lastTierOrd = tierOrd
-				a.hasLastTier = true
+				if found {
+					a.mruName = e.PodIdentifier
+					a.mruOrd = podOrd
+					a.hasMru = true
+				}
+			}
+
+			if !found {
+				continue
+			}
+
+			s, ok = a.table.lookup(podOrd)
+			if !ok {
+				continue
+			}
+
+			if e.Speculative || e.DeviceTier == SpeculativeTier {
+				tier = SpeculativeTier
+				tierOrd = speculativeTierOrdinal
+			} else {
+				tier = e.DeviceTier
+				if a.hasLastTier && a.lastTierName == e.DeviceTier {
+					tierOrd = a.lastTierOrd
+				} else {
+					if a.tierCache[0].name == e.DeviceTier {
+						tierOrd = a.tierCache[0].ord
+					} else if a.tierCache[1].name == e.DeviceTier {
+						tierOrd = a.tierCache[1].ord
+					} else if a.tierCache[2].name == e.DeviceTier {
+						tierOrd = a.tierCache[2].ord
+					} else if a.tierCache[3].name == e.DeviceTier {
+						tierOrd = a.tierCache[3].ord
+					} else {
+						tierOrd = a.tierOrdinal(e.DeviceTier)
+						if a.tierCache[0].name == "" {
+							a.tierCache[0].name = e.DeviceTier
+							a.tierCache[0].ord = tierOrd
+						} else if a.tierCache[1].name == "" {
+							a.tierCache[1].name = e.DeviceTier
+							a.tierCache[1].ord = tierOrd
+						} else if a.tierCache[2].name == "" {
+							a.tierCache[2].name = e.DeviceTier
+							a.tierCache[2].ord = tierOrd
+						} else if a.tierCache[3].name == "" {
+							a.tierCache[3].name = e.DeviceTier
+							a.tierCache[3].ord = tierOrd
+						}
+					}
+					a.lastTierName = e.DeviceTier
+					a.lastTierOrd = tierOrd
+					a.hasLastTier = true
+				}
+			}
+
+			if i < 256 {
+				a.posCache256[i] = posCacheEntry{
+					podName:     e.PodIdentifier,
+					tierName:    e.DeviceTier,
+					speculative: e.Speculative,
+					podOrd:      podOrd,
+					tierOrd:     tierOrd,
+					slot:        s,
+				}
 			}
 		}
 
@@ -1110,19 +1099,6 @@ func (a *prefixAccumulator) keyPods(entries []kvblock.PodEntry) bool {
 						break
 					}
 				}
-			}
-		}
-
-		if i < 256 {
-			a.posCache256[i] = posCacheEntry{
-				podName:     e.PodIdentifier,
-				tierName:    e.DeviceTier,
-				speculative: e.Speculative,
-				podOrd:      podOrd,
-				tierOrd:     tierOrd,
-				slot:        s,
-				weight:      w,
-				confirmed:   tierOrd != speculativeTierOrdinal,
 			}
 		}
 	}
