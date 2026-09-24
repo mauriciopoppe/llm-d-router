@@ -1,0 +1,11 @@
+{
+  "metrics": {
+    "match_walk_96pods_ns_per_op": 7110177.0,
+    "match_walk_96pods_bytes_per_op": 33415.0,
+    "match_walk_96pods_allocs_per_op": 226.0,
+    "match_materialized_96pods_ns_per_op": 23782894.0,
+    "match_materialized_96pods_bytes_per_op": 18959175.0,
+    "match_materialized_96pods_allocs_per_op": 4142.0,
+    "unit_test_failures": 0.0
+  }
+}

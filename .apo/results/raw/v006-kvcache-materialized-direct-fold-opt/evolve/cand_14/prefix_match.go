@@ -156,6 +156,18 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 }
 
 // EVOLVE-BLOCK-START
+type cacheEntry struct {
+	podName  string
+	podOrd   uint32
+	tierName string
+	tierOrd  uint32
+}
+
+type tierEntry struct {
+	name string
+	ord  uint32
+}
+
 func fastHash(s string) uint32 {
 	n := len(s)
 	if n < 2 {
@@ -174,32 +186,12 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
-	type podCacheEntry struct {
-		name string
-		ord  uint32
-	}
-	var podCache [1024]podCacheEntry
+	var podCache [512]cacheEntry
+	var posCache [256]cacheEntry
+	var mru cacheEntry
 
-	type posCacheEntry struct {
-		name     string
-		ord      uint32
-		tierName string
-		tierOrd  uint32
-	}
-	var posCache [256]posCacheEntry
-
-	var mruName string
-	var mruOrd uint32
-	var hasMru bool
-
-	type tierCacheEntry struct {
-		name string
-		ord  uint32
-	}
-	var tierCache [4]tierCacheEntry
-	var lastTierName string
-	var lastTierOrd uint32
-	var hasLastTier bool
+	var tiers [8]tierEntry
+	var numTiers int
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
@@ -224,68 +216,52 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 			writeIdx := 0
 			for i := range entries {
 				e := &entries[i]
-				var podOrd uint32
+				podOrd := acc.podOrdinal(e.PodIdentifier)
 
 				h := fastHash(e.PodIdentifier)
-				idx := h & 1023
+				idx := h & 511
 				for {
-					if podCache[idx].name == "" {
-						podOrd = acc.podOrdinal(e.PodIdentifier)
-						podCache[idx].name = e.PodIdentifier
-						podCache[idx].ord = podOrd
+					if podCache[idx].podName == "" {
+						podCache[idx].podName = e.PodIdentifier
+						podCache[idx].podOrd = podOrd
 						break
 					}
-					if podCache[idx].name == e.PodIdentifier {
-						podOrd = podCache[idx].ord
+					if podCache[idx].podName == e.PodIdentifier {
 						break
 					}
-					idx = (idx + 1) & 1023
+					idx = (idx + 1) & 511
 				}
-
-				if i < 256 {
-					posCache[i].name = e.PodIdentifier
-					posCache[i].ord = podOrd
-				}
-				mruName = e.PodIdentifier
-				mruOrd = podOrd
-				hasMru = true
 
 				var tierOrd uint32
-				if hasLastTier && lastTierName == e.DeviceTier {
-					tierOrd = lastTierOrd
+				if numTiers > 0 && tiers[0].name == e.DeviceTier {
+					tierOrd = tiers[0].ord
+				} else if numTiers > 1 && tiers[1].name == e.DeviceTier {
+					tierOrd = tiers[1].ord
 				} else {
-					if tierCache[0].name == e.DeviceTier {
-						tierOrd = tierCache[0].ord
-					} else if tierCache[1].name == e.DeviceTier {
-						tierOrd = tierCache[1].ord
-					} else if tierCache[2].name == e.DeviceTier {
-						tierOrd = tierCache[2].ord
-					} else if tierCache[3].name == e.DeviceTier {
-						tierOrd = tierCache[3].ord
-					} else {
-						tierOrd = acc.tierOrdinal(e.DeviceTier)
-						if tierCache[0].name == "" {
-							tierCache[0].name = e.DeviceTier
-							tierCache[0].ord = tierOrd
-						} else if tierCache[1].name == "" {
-							tierCache[1].name = e.DeviceTier
-							tierCache[1].ord = tierOrd
-						} else if tierCache[2].name == "" {
-							tierCache[2].name = e.DeviceTier
-							tierCache[2].ord = tierOrd
-						} else if tierCache[3].name == "" {
-							tierCache[3].name = e.DeviceTier
-							tierCache[3].ord = tierOrd
+					foundTier := false
+					for k := 2; k < numTiers; k++ {
+						if tiers[k].name == e.DeviceTier {
+							tierOrd = tiers[k].ord
+							foundTier = true
+							break
 						}
 					}
-					lastTierName = e.DeviceTier
-					lastTierOrd = tierOrd
-					hasLastTier = true
+					if !foundTier {
+						tierOrd = acc.tierOrdinal(e.DeviceTier)
+						if numTiers < 8 {
+							tiers[numTiers].name = e.DeviceTier
+							tiers[numTiers].ord = tierOrd
+							numTiers++
+						}
+					}
 				}
 
+				podCache[idx].tierName = e.DeviceTier
+				podCache[idx].tierOrd = tierOrd
+
+				mru = podCache[idx]
 				if i < 256 {
-					posCache[i].tierName = e.DeviceTier
-					posCache[i].tierOrd = tierOrd
+					posCache[i] = mru
 				}
 
 				ref := &refsBuf[writeIdx]
@@ -299,116 +275,145 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 			writeIdx := 0
 			for i := range entries {
 				e := &entries[i]
-				if i < 256 && posCache[i].name == e.PodIdentifier && posCache[i].tierName == e.DeviceTier {
+
+				// 1. Positional stability
+				if i < 256 && posCache[i].podName == e.PodIdentifier {
 					ref := &refsBuf[writeIdx]
 					ref.PodEntry = *e
-					ref.PodOrdinal = posCache[i].ord
-					ref.TierOrdinal = posCache[i].tierOrd
-					writeIdx++
-					mruName = e.PodIdentifier
-					mruOrd = posCache[i].ord
-					hasMru = true
-					continue
-				}
-
-				var podOrd uint32
-				var tierOrd uint32
-				found := false
-				tierFound := false
-
-				if i < 256 && posCache[i].name == e.PodIdentifier {
-					podOrd = posCache[i].ord
-					found = true
-					mruName = e.PodIdentifier
-					mruOrd = podOrd
-					hasMru = true
+					ref.PodOrdinal = posCache[i].podOrd
 					if posCache[i].tierName == e.DeviceTier {
-						tierOrd = posCache[i].tierOrd
-						tierFound = true
-					}
-				} else if hasMru && mruName == e.PodIdentifier {
-					podOrd = mruOrd
-					found = true
-					if i < 256 {
-						posCache[i].name = e.PodIdentifier
-						posCache[i].ord = podOrd
-						if posCache[i].tierName == e.DeviceTier {
-							tierOrd = posCache[i].tierOrd
-							tierFound = true
-						}
-					}
-				} else {
-					h := fastHash(e.PodIdentifier)
-					idx := h & 1023
-					for {
-						if podCache[idx].name == "" {
-							break
-						}
-						if podCache[idx].name == e.PodIdentifier {
-							podOrd = podCache[idx].ord
-							found = true
-							break
-						}
-						idx = (idx + 1) & 1023
-					}
-					if found {
-						mruName = e.PodIdentifier
-						mruOrd = podOrd
-						hasMru = true
-						if i < 256 {
-							posCache[i].name = e.PodIdentifier
-							posCache[i].ord = podOrd
-						}
-					}
-				}
-
-				if !found {
-					continue
-				}
-
-				if !tierFound {
-					if hasLastTier && lastTierName == e.DeviceTier {
-						tierOrd = lastTierOrd
+						ref.TierOrdinal = posCache[i].tierOrd
 					} else {
-						if tierCache[0].name == e.DeviceTier {
-							tierOrd = tierCache[0].ord
-						} else if tierCache[1].name == e.DeviceTier {
-							tierOrd = tierCache[1].ord
-						} else if tierCache[2].name == e.DeviceTier {
-							tierOrd = tierCache[2].ord
-						} else if tierCache[3].name == e.DeviceTier {
-							tierOrd = tierCache[3].ord
+						var tierOrd uint32
+						if numTiers > 0 && tiers[0].name == e.DeviceTier {
+							tierOrd = tiers[0].ord
+						} else if numTiers > 1 && tiers[1].name == e.DeviceTier {
+							tierOrd = tiers[1].ord
 						} else {
-							tierOrd = acc.tierOrdinal(e.DeviceTier)
-							if tierCache[0].name == "" {
-								tierCache[0].name = e.DeviceTier
-								tierCache[0].ord = tierOrd
-							} else if tierCache[1].name == "" {
-								tierCache[1].name = e.DeviceTier
-								tierCache[1].ord = tierOrd
-							} else if tierCache[2].name == "" {
-								tierCache[2].name = e.DeviceTier
-								tierCache[2].ord = tierOrd
-							} else if tierCache[3].name == "" {
-								tierCache[3].name = e.DeviceTier
-								tierCache[3].ord = tierOrd
+							foundTier := false
+							for k := 2; k < numTiers; k++ {
+								if tiers[k].name == e.DeviceTier {
+									tierOrd = tiers[k].ord
+									foundTier = true
+									break
+								}
+							}
+							if !foundTier {
+								tierOrd = acc.tierOrdinal(e.DeviceTier)
+								if numTiers < 8 {
+									tiers[numTiers].name = e.DeviceTier
+									tiers[numTiers].ord = tierOrd
+									numTiers++
+								}
 							}
 						}
-						lastTierName = e.DeviceTier
-						lastTierOrd = tierOrd
-						hasLastTier = true
-					}
-					if i < 256 {
 						posCache[i].tierName = e.DeviceTier
 						posCache[i].tierOrd = tierOrd
+						ref.TierOrdinal = tierOrd
 					}
+					mru = posCache[i]
+					writeIdx++
+					continue
 				}
 
-				ref := &refsBuf[writeIdx]
-				ref.PodEntry = *e
-				ref.PodOrdinal = podOrd
-				ref.TierOrdinal = tierOrd
-				writeIdx++
+				// 2. MRU cache
+				if mru.podName == e.PodIdentifier {
+					ref := &refsBuf[writeIdx]
+					ref.PodEntry = *e
+					ref.PodOrdinal = mru.podOrd
+					if mru.tierName == e.DeviceTier {
+						ref.TierOrdinal = mru.tierOrd
+					} else {
+						var tierOrd uint32
+						if numTiers > 0 && tiers[0].name == e.DeviceTier {
+							tierOrd = tiers[0].ord
+						} else if numTiers > 1 && tiers[1].name == e.DeviceTier {
+							tierOrd = tiers[1].ord
+						} else {
+							foundTier := false
+							for k := 2; k < numTiers; k++ {
+								if tiers[k].name == e.DeviceTier {
+									tierOrd = tiers[k].ord
+									foundTier = true
+									break
+								}
+							}
+							if !foundTier {
+								tierOrd = acc.tierOrdinal(e.DeviceTier)
+								if numTiers < 8 {
+									tiers[numTiers].name = e.DeviceTier
+									tiers[numTiers].ord = tierOrd
+									numTiers++
+								}
+							}
+						}
+						mru.tierName = e.DeviceTier
+						mru.tierOrd = tierOrd
+						ref.TierOrdinal = tierOrd
+					}
+					if i < 256 {
+						posCache[i] = mru
+					}
+					writeIdx++
+					continue
+				}
+
+				// 3. Fallback to hash-table podCache
+				h := fastHash(e.PodIdentifier)
+				idx := h & 511
+				found := false
+				for {
+					if podCache[idx].podName == "" {
+						break
+					}
+					if podCache[idx].podName == e.PodIdentifier {
+						entry := &podCache[idx]
+						var tierOrd uint32
+						if entry.tierName == e.DeviceTier {
+							tierOrd = entry.tierOrd
+						} else {
+							if numTiers > 0 && tiers[0].name == e.DeviceTier {
+								tierOrd = tiers[0].ord
+							} else if numTiers > 1 && tiers[1].name == e.DeviceTier {
+								tierOrd = tiers[1].ord
+							} else {
+								foundTier := false
+								for k := 2; k < numTiers; k++ {
+									if tiers[k].name == e.DeviceTier {
+										tierOrd = tiers[k].ord
+										foundTier = true
+										break
+									}
+								}
+								if !foundTier {
+									tierOrd = acc.tierOrdinal(e.DeviceTier)
+									if numTiers < 8 {
+										tiers[numTiers].name = e.DeviceTier
+										tiers[numTiers].ord = tierOrd
+										numTiers++
+									}
+								}
+							}
+							entry.tierName = e.DeviceTier
+							entry.tierOrd = tierOrd
+						}
+						mru = *entry
+						if i < 256 {
+							posCache[i] = *entry
+						}
+						ref := &refsBuf[writeIdx]
+						ref.PodEntry = *e
+						ref.PodOrdinal = entry.podOrd
+						ref.TierOrdinal = tierOrd
+						writeIdx++
+						found = true
+						break
+					}
+					idx = (idx + 1) & 511
+				}
+				if found {
+					continue
+				}
 			}
 			acc.refsBuf = refsBuf[:writeIdx]
 		}

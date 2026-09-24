@@ -156,15 +156,21 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 }
 
 // EVOLVE-BLOCK-START
+// matchMaterialized feeds the accumulator from a Lookup result, walking keys
+// in order and stopping at the first key without entries. Pod and tier
+// ordinals are assigned per call, since materialized entries carry none.
 func fastHash(s string) uint32 {
 	n := len(s)
-	if n < 2 {
-		if n == 1 {
-			return uint32(s[0])
-		}
-		return 0
+	if n >= 3 {
+		return uint32(s[n-1])*33 ^ uint32(s[n-2])*31 ^ uint32(s[n-3]) ^ uint32(n)
 	}
-	return uint32(s[n-1])*31 + uint32(s[n-2])
+	if n == 2 {
+		return uint32(s[1])*31 ^ uint32(s[0]) ^ 2
+	}
+	if n == 1 {
+		return uint32(s[0]) ^ 1
+	}
+	return 0
 }
 
 func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
@@ -174,32 +180,29 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
-	type podCacheEntry struct {
-		name string
-		ord  uint32
-	}
-	var podCache [1024]podCacheEntry
+	var podCacheName [1024]string
+	var podCacheOrd [1024]uint32
+	var podCacheTierOrd [1024]uint32
 
-	type posCacheEntry struct {
-		name     string
-		ord      uint32
-		tierName string
-		tierOrd  uint32
-	}
-	var posCache [256]posCacheEntry
+	var posCacheName [512]string
+	var posCacheOrd [512]uint32
+	var posCacheTierOrd [512]uint32
 
 	var mruName string
 	var mruOrd uint32
+	var mruTierOrd uint32
 	var hasMru bool
 
-	type tierCacheEntry struct {
-		name string
-		ord  uint32
-	}
-	var tierCache [4]tierCacheEntry
+	var tierCacheName [4]string
+	var tierCacheOrd [4]uint32
 	var lastTierName string
 	var lastTierOrd uint32
 	var hasLastTier bool
+
+	refsBuf := acc.refsBuf
+	if cap(refsBuf) < 512 {
+		refsBuf = make([]kvblock.EntryRef, 512)
+	}
 
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
@@ -209,73 +212,47 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		if len(entries) == 0 {
 			break
 		}
-		if cap(acc.refsBuf) < len(entries) {
-			allocCap := len(entries)
-			if allocCap < 128 {
-				allocCap = 128
-			} else {
-				allocCap = allocCap * 2
-			}
-			acc.refsBuf = make([]kvblock.EntryRef, allocCap)
+		if len(entries) > cap(refsBuf) {
+			refsBuf = make([]kvblock.EntryRef, len(entries)*2)
 		}
-		refsBuf := acc.refsBuf[:len(entries)]
+		refsBuf = refsBuf[:cap(refsBuf)]
 
 		if pos == 0 {
 			writeIdx := 0
 			for i := range entries {
 				e := &entries[i]
-				var podOrd uint32
-
-				h := fastHash(e.PodIdentifier)
-				idx := h & 1023
-				for {
-					if podCache[idx].name == "" {
-						podOrd = acc.podOrdinal(e.PodIdentifier)
-						podCache[idx].name = e.PodIdentifier
-						podCache[idx].ord = podOrd
-						break
-					}
-					if podCache[idx].name == e.PodIdentifier {
-						podOrd = podCache[idx].ord
-						break
-					}
-					idx = (idx + 1) & 1023
-				}
-
-				if i < 256 {
-					posCache[i].name = e.PodIdentifier
-					posCache[i].ord = podOrd
-				}
-				mruName = e.PodIdentifier
-				mruOrd = podOrd
-				hasMru = true
 
 				var tierOrd uint32
 				if hasLastTier && lastTierName == e.DeviceTier {
 					tierOrd = lastTierOrd
 				} else {
-					if tierCache[0].name == e.DeviceTier {
-						tierOrd = tierCache[0].ord
-					} else if tierCache[1].name == e.DeviceTier {
-						tierOrd = tierCache[1].ord
-					} else if tierCache[2].name == e.DeviceTier {
-						tierOrd = tierCache[2].ord
-					} else if tierCache[3].name == e.DeviceTier {
-						tierOrd = tierCache[3].ord
+					if tierCacheName[0] == e.DeviceTier {
+						tierOrd = tierCacheOrd[0]
+					} else if tierCacheName[1] == e.DeviceTier {
+						tierOrd = tierCacheOrd[1]
+					} else if tierCacheName[2] == e.DeviceTier {
+						tierOrd = tierCacheOrd[2]
+					} else if tierCacheName[3] == e.DeviceTier {
+						tierOrd = tierCacheOrd[3]
 					} else {
-						tierOrd = acc.tierOrdinal(e.DeviceTier)
-						if tierCache[0].name == "" {
-							tierCache[0].name = e.DeviceTier
-							tierCache[0].ord = tierOrd
-						} else if tierCache[1].name == "" {
-							tierCache[1].name = e.DeviceTier
-							tierCache[1].ord = tierOrd
-						} else if tierCache[2].name == "" {
-							tierCache[2].name = e.DeviceTier
-							tierCache[2].ord = tierOrd
-						} else if tierCache[3].name == "" {
-							tierCache[3].name = e.DeviceTier
-							tierCache[3].ord = tierOrd
+						var ok bool
+						tierOrd, ok = acc.tiersMap[e.DeviceTier]
+						if !ok {
+							tierOrd = uint32(len(acc.tiersMap))
+							acc.tiersMap[e.DeviceTier] = tierOrd
+						}
+						if tierCacheName[0] == "" {
+							tierCacheName[0] = e.DeviceTier
+							tierCacheOrd[0] = tierOrd
+						} else if tierCacheName[1] == "" {
+							tierCacheName[1] = e.DeviceTier
+							tierCacheOrd[1] = tierOrd
+						} else if tierCacheName[2] == "" {
+							tierCacheName[2] = e.DeviceTier
+							tierCacheOrd[2] = tierOrd
+						} else if tierCacheName[3] == "" {
+							tierCacheName[3] = e.DeviceTier
+							tierCacheOrd[3] = tierOrd
 						}
 					}
 					lastTierName = e.DeviceTier
@@ -283,10 +260,36 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 					hasLastTier = true
 				}
 
-				if i < 256 {
-					posCache[i].tierName = e.DeviceTier
-					posCache[i].tierOrd = tierOrd
+				podOrd, ok := acc.podsMap[e.PodIdentifier]
+				if !ok {
+					podOrd = uint32(len(acc.podsMap))
+					acc.podsMap[e.PodIdentifier] = podOrd
 				}
+
+				h := fastHash(e.PodIdentifier)
+				idx := h & 1023
+				for {
+					if podCacheName[idx] == "" {
+						podCacheName[idx] = e.PodIdentifier
+						podCacheOrd[idx] = podOrd
+						podCacheTierOrd[idx] = tierOrd
+						break
+					}
+					if podCacheName[idx] == e.PodIdentifier {
+						break
+					}
+					idx = (idx + 1) & 1023
+				}
+
+				if i < 512 {
+					posCacheName[i] = e.PodIdentifier
+					posCacheOrd[i] = podOrd
+					posCacheTierOrd[i] = tierOrd
+				}
+				mruName = e.PodIdentifier
+				mruOrd = podOrd
+				mruTierOrd = tierOrd
+				hasMru = true
 
 				ref := &refsBuf[writeIdx]
 				ref.PodEntry = *e
@@ -299,53 +302,36 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 			writeIdx := 0
 			for i := range entries {
 				e := &entries[i]
-				if i < 256 && posCache[i].name == e.PodIdentifier && posCache[i].tierName == e.DeviceTier {
-					ref := &refsBuf[writeIdx]
-					ref.PodEntry = *e
-					ref.PodOrdinal = posCache[i].ord
-					ref.TierOrdinal = posCache[i].tierOrd
-					writeIdx++
-					mruName = e.PodIdentifier
-					mruOrd = posCache[i].ord
-					hasMru = true
-					continue
-				}
-
-				var podOrd uint32
-				var tierOrd uint32
+				var podOrd, tierOrd uint32
 				found := false
-				tierFound := false
 
-				if i < 256 && posCache[i].name == e.PodIdentifier {
-					podOrd = posCache[i].ord
+				if i < 512 && posCacheName[i] == e.PodIdentifier {
+					podOrd = posCacheOrd[i]
+					tierOrd = posCacheTierOrd[i]
 					found = true
 					mruName = e.PodIdentifier
 					mruOrd = podOrd
+					mruTierOrd = tierOrd
 					hasMru = true
-					if posCache[i].tierName == e.DeviceTier {
-						tierOrd = posCache[i].tierOrd
-						tierFound = true
-					}
 				} else if hasMru && mruName == e.PodIdentifier {
 					podOrd = mruOrd
+					tierOrd = mruTierOrd
 					found = true
-					if i < 256 {
-						posCache[i].name = e.PodIdentifier
-						posCache[i].ord = podOrd
-						if posCache[i].tierName == e.DeviceTier {
-							tierOrd = posCache[i].tierOrd
-							tierFound = true
-						}
+					if i < 512 {
+						posCacheName[i] = e.PodIdentifier
+						posCacheOrd[i] = podOrd
+						posCacheTierOrd[i] = tierOrd
 					}
 				} else {
 					h := fastHash(e.PodIdentifier)
 					idx := h & 1023
 					for {
-						if podCache[idx].name == "" {
+						if podCacheName[idx] == "" {
 							break
 						}
-						if podCache[idx].name == e.PodIdentifier {
-							podOrd = podCache[idx].ord
+						if podCacheName[idx] == e.PodIdentifier {
+							podOrd = podCacheOrd[idx]
+							tierOrd = podCacheTierOrd[idx]
 							found = true
 							break
 						}
@@ -354,54 +340,18 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 					if found {
 						mruName = e.PodIdentifier
 						mruOrd = podOrd
+						mruTierOrd = tierOrd
 						hasMru = true
-						if i < 256 {
-							posCache[i].name = e.PodIdentifier
-							posCache[i].ord = podOrd
+						if i < 512 {
+							posCacheName[i] = e.PodIdentifier
+							posCacheOrd[i] = podOrd
+							posCacheTierOrd[i] = tierOrd
 						}
 					}
 				}
 
 				if !found {
 					continue
-				}
-
-				if !tierFound {
-					if hasLastTier && lastTierName == e.DeviceTier {
-						tierOrd = lastTierOrd
-					} else {
-						if tierCache[0].name == e.DeviceTier {
-							tierOrd = tierCache[0].ord
-						} else if tierCache[1].name == e.DeviceTier {
-							tierOrd = tierCache[1].ord
-						} else if tierCache[2].name == e.DeviceTier {
-							tierOrd = tierCache[2].ord
-						} else if tierCache[3].name == e.DeviceTier {
-							tierOrd = tierCache[3].ord
-						} else {
-							tierOrd = acc.tierOrdinal(e.DeviceTier)
-							if tierCache[0].name == "" {
-								tierCache[0].name = e.DeviceTier
-								tierCache[0].ord = tierOrd
-							} else if tierCache[1].name == "" {
-								tierCache[1].name = e.DeviceTier
-								tierCache[1].ord = tierOrd
-							} else if tierCache[2].name == "" {
-								tierCache[2].name = e.DeviceTier
-								tierCache[2].ord = tierOrd
-							} else if tierCache[3].name == "" {
-								tierCache[3].name = e.DeviceTier
-								tierCache[3].ord = tierOrd
-							}
-						}
-						lastTierName = e.DeviceTier
-						lastTierOrd = tierOrd
-						hasLastTier = true
-					}
-					if i < 256 {
-						posCache[i].tierName = e.DeviceTier
-						posCache[i].tierOrd = tierOrd
-					}
 				}
 
 				ref := &refsBuf[writeIdx]
@@ -416,6 +366,7 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		if !acc.key(acc.refsBuf) {
 			break
 		}
+		refsBuf = acc.refsBuf
 	}
 	// Cancellation is sampled at checkpoints along the keys and once more at
 	// completion, so a cancelled request never reports a match.
