@@ -155,6 +155,7 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 	return matchMaterialized(ctx, keys, keyToPods, weights, filter)
 }
 
+// EVOLVE-BLOCK-START
 // matchMaterialized feeds the accumulator from a Lookup result, walking keys
 // in order and stopping at the first key without entries. Pod and tier
 // ordinals are assigned per call, since materialized entries carry none.
@@ -198,12 +199,29 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	return acc.result(), nil
 }
 
+func (a *prefixAccumulator) podOrdinal(name string) uint32 {
+	if id, ok := a.podsMap[name]; ok {
+		return id
+	}
+	id := uint32(len(a.podsMap))
+	a.podsMap[name] = id
+	return id
+}
+
+func (a *prefixAccumulator) tierOrdinal(name string) uint32 {
+	if id, ok := a.tiersMap[name]; ok {
+		return id
+	}
+	id := uint32(len(a.tiersMap))
+	a.tiersMap[name] = id
+	return id
+}
+// EVOLVE-BLOCK-END
+
 
 // speculativeTierOrdinal keys the speculative per-tier chain. Feeders assign
 // tier ordinals from zero, so the top of the range never collides.
 const speculativeTierOrdinal = math.MaxUint32
-
-// EVOLVE-BLOCK-START
 // slotTable is an open-addressed map from pod ordinal to request-local slot.
 // It is sized by the first key's entry count, so request state scales with
 // the live candidates rather than with every ordinal an index ever assigned.
@@ -521,7 +539,6 @@ func (a *prefixAccumulator) endKey() bool {
 	a.active = keep
 	return len(a.active) > 0
 }
-// EVOLVE-BLOCK-END
 
 // result materializes the accumulated matches.
 func (a *prefixAccumulator) result() map[string]PodMatch {
@@ -565,23 +582,6 @@ func (a *prefixAccumulator) newSlot(pod string) int32 {
 	return int32(n)
 }
 
-func (a *prefixAccumulator) podOrdinal(name string) uint32 {
-	if id, ok := a.podsMap[name]; ok {
-		return id
-	}
-	id := uint32(len(a.podsMap))
-	a.podsMap[name] = id
-	return id
-}
-
-func (a *prefixAccumulator) tierOrdinal(name string) uint32 {
-	if id, ok := a.tiersMap[name]; ok {
-		return id
-	}
-	id := uint32(len(a.tiersMap))
-	a.tiersMap[name] = id
-	return id
-}
 
 // weightOf resolves a tier's weight, caching by ordinal so the configured
 // map is consulted once per tier per accumulation.
